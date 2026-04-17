@@ -491,7 +491,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
     if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        mctx->set_input_kq_mask_with_tree(self_kq_mask, ubatch, cparams.causal_attn, cparams.tree_spec);
     }
 
     if (self_k_rot) {
@@ -521,7 +521,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    mctx->set_input_kq_mask_with_tree(self_kq_mask, ubatch, cparams.causal_attn, cparams.tree_spec);
 }
 
 bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
@@ -541,11 +541,11 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
     mctx->get_mla()->set_input_k_idxs(self_k_idxs_mla, ubatch);
 
-    mctx->get_mla()->set_input_kq_mask(self_kq_mask_mla, ubatch, cparams.causal_attn);
+    mctx->get_mla()->set_input_kq_mask_with_tree(self_kq_mask_mla, ubatch, cparams.causal_attn, cparams.tree_spec);
 
     mctx->get_lid()->set_input_k_idxs(self_k_idxs_lid, ubatch);
 
-    mctx->get_lid()->set_input_kq_mask(self_kq_mask_lid, ubatch, cparams.causal_attn);
+    mctx->get_lid()->set_input_kq_mask_with_tree(self_kq_mask_lid, ubatch, cparams.causal_attn, cparams.tree_spec);
 
     mctx->get_lid()->set_input_k_rot(self_k_rot_lid);
 }
@@ -577,7 +577,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
 
     // the kq mask guards on its own buffer: shared cells leave idxs unbacked while the mask stays live
     if (self_kq_mask && self_kq_mask->buffer) {
-        mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        mctx->get_base()->set_input_kq_mask_with_tree(self_kq_mask, ubatch, cparams.causal_attn, cparams.tree_spec);
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -589,7 +589,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
-        mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
+        mctx->get_swa()->set_input_kq_mask_with_tree(self_kq_mask_swa, ubatch, cparams.causal_attn, cparams.tree_spec);
     }
 
     if (self_k_rot) {
@@ -956,7 +956,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    mctx->get_attn()->set_input_kq_mask_with_tree(inp_attn->self_kq_mask, ubatch, cparams.causal_attn, cparams.tree_spec);
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1008,7 +1008,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    mctx->get_attn()->set_input_kq_mask_with_tree(inp_attn->self_kq_mask, ubatch, cparams.causal_attn, cparams.tree_spec);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1055,7 +1055,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
-        attn_ctx->get_base()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+        attn_ctx->get_base()->set_input_kq_mask_with_tree(inp_attn->self_kq_mask, ubatch, cparams.causal_attn, cparams.tree_spec);
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -1065,7 +1065,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     }
 
     if (inp_attn->self_kq_mask_swa && inp_attn->self_kq_mask_swa->buffer) {
-        attn_ctx->get_swa()->set_input_kq_mask(inp_attn->self_kq_mask_swa, ubatch, cparams.causal_attn);
+        attn_ctx->get_swa()->set_input_kq_mask_with_tree(inp_attn->self_kq_mask_swa, ubatch, cparams.causal_attn, cparams.tree_spec);
     }
 
     if (inp_attn->self_k_rot) {
