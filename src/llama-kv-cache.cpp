@@ -1427,9 +1427,57 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    // tree attention spec (for speculative decoding with tree masks)
+    const llama_tree_spec * tree_spec;
+    bool tree_attn;
+    int tree_offset;  // position in context where tree starts
 };
 
-template<bool causal, bool swa, bool is_2d, bool alibi>
+// Helper function to check if key node j is an ancestor of query node i in tree
+// tree_offset: the position in full context where the tree starts (prefix_len)
+static bool is_tree_ancestor(const llama_tree_spec * tree_spec, int j, int i, int tree_offset) {
+    if (!tree_spec || !tree_spec->parent_ids || tree_spec->n_nodes == 0) {
+        return false;
+    }
+
+    // Convert context positions to tree-relative positions
+    int j_tree = j - tree_offset;
+    int i_tree = i - tree_offset;
+
+    // If j is in the prefix (j_tree < 0), it's always a valid ancestor
+    // (prefix can attend to tree, though this shouldn't normally happen in tree mode)
+    if (j_tree < 0) {
+        return true;
+    }
+
+    // If i is in the prefix (i_tree < 0), this position isn't in the tree
+    if (i_tree < 0) {
+        return false;
+    }
+
+    // Both j and i should be in tree range [0, n_nodes)
+    if (j_tree < 0 || j_tree >= tree_spec->n_nodes ||
+        i_tree < 0 || i_tree >= tree_spec->n_nodes) {
+        return false;
+    }
+
+    // Trace parent chain from i to root, checking if j is encountered
+    int current = i_tree;
+    while (current != -1) {
+        if (current == j_tree) {
+            return true;
+        }
+        if (current >= 0 && current < tree_spec->n_nodes) {
+            current = tree_spec->parent_ids[current];
+        } else {
+            break;
+        }
+    }
+    return false;
+}
+
+template<bool causal, bool swa, bool is_2d, bool alibi, bool tree_attn>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
   //const auto & hparams = args.hparams;
     const auto & ubatch  = args.ubatch;
@@ -1554,6 +1602,15 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
                     }
                 }
 
+                // tree attention: only allow attendance to ancestors in the tree
+                if (tree_attn && args.tree_spec) {
+                    // i is the query index, j is the key index
+                    // Use tree_offset from args to convert context positions to tree-relative
+                    if (!is_tree_ancestor(args.tree_spec, j, i, args.tree_offset)) {
+                        goto skip;
+                    }
+                }
+
                 // apply SWA if any
                 if (swa) {
                     if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
@@ -1578,10 +1635,19 @@ skip:
 template<bool causal, bool swa, bool is_2d>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * data) {
     const bool alibi = args.hparams.use_alibi;
+    const bool tree_attn = args.tree_attn;
     if (alibi) {
-        set_input_kq_mask_impl<causal, swa, is_2d, true> (args, data);
+        if (tree_attn) {
+            set_input_kq_mask_impl<causal, swa, is_2d, true, true> (args, data);
+        } else {
+            set_input_kq_mask_impl<causal, swa, is_2d, true, false> (args, data);
+        }
     } else {
-        set_input_kq_mask_impl<causal, swa, is_2d, false>(args, data);
+        if (tree_attn) {
+            set_input_kq_mask_impl<causal, swa, is_2d, false, true> (args, data);
+        } else {
+            set_input_kq_mask_impl<causal, swa, is_2d, false, false> (args, data);
+        }
     }
 }
 
@@ -1606,6 +1672,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    // Call the version with no tree spec (backward compatible)
+    set_input_kq_mask_with_tree(dst, ubatch, causal_attn, nullptr);
+}
+
+void llama_kv_cache::set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_tree_spec * tree_spec) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1621,6 +1692,9 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     //const int64_t t_start = ggml_time_us();
 
+    const bool tree_attn = (tree_spec != nullptr && tree_spec->parent_ids != nullptr);
+    const int tree_offset = tree_spec ? tree_spec->tree_offset : 0;
+
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
         /*.ubatch           =*/ ubatch,
@@ -1631,6 +1705,9 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.tree_spec        =*/ tree_spec,
+        /*.tree_attn        =*/ tree_attn,
+        /*.tree_offset      =*/ tree_offset,
     };
 
     if (causal_attn) {
@@ -2489,6 +2566,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_tree_spec * tree_spec) const {
+    kv->set_input_kq_mask_with_tree(dst, ubatch, causal_attn, tree_spec);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

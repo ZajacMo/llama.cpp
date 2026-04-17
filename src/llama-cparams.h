@@ -40,6 +40,9 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // tree attention spec for speculative decoding with tree masks
+    const llama_tree_spec * tree_spec;
+
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;

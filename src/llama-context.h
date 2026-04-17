@@ -103,6 +103,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
+    void set_tree_spec(const llama_tree_spec * tree_spec);
     void set_warmup(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);

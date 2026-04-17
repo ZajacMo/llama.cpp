@@ -150,6 +150,8 @@ llama_context::llama_context(
         cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
     }
 
+    cparams.tree_spec = nullptr; // no tree attention by default
+
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
@@ -1048,6 +1050,14 @@ void llama_context::set_causal_attn(bool value) {
     }
 
     cparams.causal_attn = value;
+
+    sched_need_reserve = true;
+}
+
+void llama_context::set_tree_spec(const llama_tree_spec * tree_spec) {
+    LLAMA_LOG_DEBUG("%s: tree_spec = %p\n", __func__, (void*)tree_spec);
+
+    cparams.tree_spec = tree_spec;
 
     sched_need_reserve = true;
 }
@@ -3452,6 +3462,29 @@ int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
     const int ret = ctx->decode(batch);
+    if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    }
+
+    return ret;
+}
+
+int32_t llama_decode_with_tree(
+        llama_context * ctx,
+          llama_batch   batch,
+          llama_tree_spec tree,
+          bool           causal_attn) {
+    // Set tree spec with proper offset before decode
+    // The tree_offset should be set by the caller (e.g., committed_prefix.size())
+    ctx->set_tree_spec(&tree);
+    ctx->set_causal_attn(causal_attn);
+
+    // Call decode with the modified params
+    const int ret = ctx->decode(batch);
+
+    // Reset to default (no tree attention) after decode
+    ctx->set_tree_spec(nullptr);
+
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

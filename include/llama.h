@@ -243,6 +243,15 @@ extern "C" {
         int8_t       *  logits;   // TODO: rename this to "output"
     } llama_batch;
 
+    // Tree structure specification for tree attention
+    // Used in llama_decode_with_tree() for speculative decoding with tree masks
+    typedef struct llama_tree_spec {
+        int32_t n_nodes;           // number of nodes in the tree
+        int32_t * parent_ids;       // parent node id for each node (-1 for root)
+                                    // size must be >= n_nodes
+        int32_t tree_offset;        // position in context where tree starts (prefix length)
+    } llama_tree_spec;
+
     enum llama_model_kv_override_type {
         LLAMA_KV_OVERRIDE_TYPE_INT,
         LLAMA_KV_OVERRIDE_TYPE_FLOAT,
@@ -960,6 +969,28 @@ extern "C" {
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    // Process a batch of tokens with tree attention mask.
+    // Similar to llama_decode() but uses tree_spec to determine attention masks.
+    // This enables parallel verification of multiple draft branches in speculative decoding.
+    // Parameters:
+    //   - ctx: the llama context
+    //   - batch: the token batch to process
+    //   - tree: the tree structure specification for attention masks
+    //           If tree.parent_ids is NULL, falls back to causal attention.
+    //   - causal_attn: if true, apply causal masking in addition to tree masking
+    // Return values:
+    //   > 0 - success (number of processed ubatches)
+    //    0 - success
+    //    1 - no tokens processed
+    //    2 - aborted
+    //   -1 - invalid input batch
+    // < -1 - fatal error
+    LLAMA_API int32_t llama_decode_with_tree(
+            struct llama_context * ctx,
+              struct llama_batch   batch,
+              struct llama_tree_spec tree,
+              bool                 causal_attn);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)

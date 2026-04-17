@@ -12,6 +12,7 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+struct llama_tree_spec;
 
 //
 // llama_kv_cache
@@ -203,6 +204,7 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_tree_spec * tree_spec) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -380,6 +382,7 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_tree_spec * tree_spec) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
