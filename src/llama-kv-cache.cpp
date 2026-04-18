@@ -1604,9 +1604,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
 
                 // tree attention: only allow attendance to ancestors in the tree
                 if (tree_attn && args.tree_spec) {
-                    // i is the query index, j is the key index
+                    // p0 is the key position, p1 is the query position
                     // Use tree_offset from args to convert context positions to tree-relative
-                    if (!is_tree_ancestor(args.tree_spec, j, i, args.tree_offset)) {
+                    if (!is_tree_ancestor(args.tree_spec, p0, p1, args.tree_offset)) {
                         goto skip;
                     }
                 }
