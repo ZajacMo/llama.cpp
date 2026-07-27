@@ -997,6 +997,15 @@ extern "C" {
               struct llama_tree_spec tree,
               bool                 causal_attn);
 
+    // Set the active tree attention spec for subsequent llama_decode() calls.
+    // If tree.parent_ids is NULL or tree.n_nodes == 0, decoding falls back to
+    // causal attention. The spec pointer is stored internally; the caller must
+    // keep it alive. Changing only the pointed-to data (same pointer) does not
+    // invalidate the compute graph, enabling graph reuse across speculative rounds.
+    LLAMA_API void llama_set_tree_spec(
+            struct llama_context * ctx,
+              const struct llama_tree_spec * tree);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
@@ -1011,6 +1020,10 @@ extern "C" {
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
+
+    // When enabled, batch.logits selects both logits and embedding output rows.
+    // The default is disabled, preserving the all-token embedding behavior.
+    LLAMA_API void llama_set_embeddings_sparse(struct llama_context * ctx, bool sparse);
 
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens

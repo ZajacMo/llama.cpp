@@ -1140,6 +1140,12 @@ void llama_context::set_embeddings(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_embeddings_sparse(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    embeddings_sparse = value;
+}
+
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -1176,6 +1182,14 @@ void llama_context::set_causal_attn(bool value) {
 
 void llama_context::set_tree_spec(const llama_tree_spec * tree_spec) {
     LLAMA_LOG_DEBUG("%s: tree_spec = %p\n", __func__, (void*)tree_spec);
+
+    // CoSpec: the tree spec data is updated in place (same pointer) between
+    // speculative decode rounds. Re-reserving the scheduler on every round
+    // forces a full graph rebuild. Only trigger a reserve when the pointer
+    // actually changes (i.e. switching to a different fixed-shape spec).
+    if (cparams.tree_spec == tree_spec) {
+        return;
+    }
 
     cparams.tree_spec = tree_spec;
 
@@ -1708,8 +1722,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const int64_t n_vocab = vocab.n_tokens();
     const int64_t n_embd  = hparams.n_embd_inp();
 
-    // when computing embeddings, all tokens are output
-    const bool output_all   = cparams.embeddings;
+    // By default embeddings are returned for all tokens. Callers that need
+    // selected token embeddings can opt into the batch.logits output mask.
+    const bool output_all   = cparams.embeddings && !embeddings_sparse;
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
@@ -3659,6 +3674,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
 }
 
+void llama_set_embeddings_sparse(llama_context * ctx, bool sparse) {
+    ctx->set_embeddings_sparse(sparse);
+}
+
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }
@@ -4097,6 +4116,12 @@ int32_t llama_decode_with_tree(
     }
 
     return ret;
+}
+
+void llama_set_tree_spec(
+        llama_context * ctx,
+          const llama_tree_spec * tree) {
+    ctx->set_tree_spec(tree);
 }
 
 //

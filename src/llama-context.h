@@ -113,6 +113,7 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
+    void set_embeddings_sparse(bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
@@ -277,6 +278,8 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    bool embeddings_sparse = false;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
