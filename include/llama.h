@@ -249,6 +249,7 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+        int32_t      *  tree_node_ids; // transient tree node identity, or NULL
     } llama_batch;
 
     // Tree structure specification for tree attention
@@ -761,6 +762,59 @@ extern "C" {
                  llama_pos p1,
                  llama_pos delta);
 
+    // Commit an accepted path from a tree decode without re-decoding it.
+    // `path_node_ids` contains the accepted tree node ids in path order. The
+    // root (node 0) and accepted cells are retained and converted to ordinary
+    // prefix KV; all other cells from this tree are removed. Tree nodes may
+    // share logical positions (for example siblings at the same depth).
+    // Returns false when the backend cannot commit or validation fails.
+    LLAMA_API bool llama_memory_seq_commit_tree(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                    int32_t n_nodes,
+        const       int32_t * path_node_ids,
+                    int32_t path_len);
+
+    // Commit a tree whose root was already present as canonical KV at
+    // `root_pos`; tree node ids then start at the first decoded child (0).
+    LLAMA_API bool llama_memory_seq_commit_tree_rooted(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                  llama_pos root_pos,
+                    int32_t n_nodes,
+        const       int32_t * path_node_ids,
+                    int32_t path_len);
+
+    // Commit and physically compact an accepted rooted tree path so ordinary
+    // causal decode observes canonical KV cell order without re-decoding.
+    LLAMA_API bool llama_context_seq_commit_tree_rooted(
+            struct llama_context * ctx,
+              llama_seq_id seq_id,
+                  llama_pos root_pos,
+                    int32_t n_nodes,
+        const       int32_t * path_node_ids,
+                    int32_t path_len);
+
+    // Debug-only helper for comparing a tree KV row with its canonical row.
+    // Select by tree_node_id when non-negative, otherwise by logical position.
+    LLAMA_API bool llama_memory_debug_k_hash(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                    int32_t layer,
+                    int32_t tree_node_id,
+                  llama_pos pos,
+                   uint64_t * hash);
+
+    // Debug-only counterpart for the V cache row. Selection semantics match
+    // llama_memory_debug_k_hash().
+    LLAMA_API bool llama_memory_debug_v_hash(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                    int32_t layer,
+                    int32_t tree_node_id,
+                  llama_pos pos,
+                   uint64_t * hash);
+
     // Integer division of the positions by factor of `d > 1`
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
@@ -1025,6 +1079,10 @@ extern "C" {
     // The default is disabled, preserving the all-token embedding behavior.
     LLAMA_API void llama_set_embeddings_sparse(struct llama_context * ctx, bool sparse);
 
+    // Export the model's final hidden rows independently of batch.logits.
+    // When masked is false, one row is returned for every decoded token.
+    LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
@@ -1075,6 +1133,17 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 
+    // Project normalized final hidden rows through the model output head only.
+    // Does not modify KV state. Returns false for unsupported model heads.
+    LLAMA_API bool llama_project_embeddings(
+            struct llama_context * ctx,
+                    const float * embeddings,
+                        int32_t   n_rows,
+                          float * logits_out);
+
+    LLAMA_API float * llama_get_embeddings_nextn_ith(
+            struct llama_context * ctx, int32_t i);
+
     // Get the embeddings for a sequence id
     // Returns NULL if pooling_type is LLAMA_POOLING_TYPE_NONE
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[n_cls_out] with the rank(s) of the sequence
@@ -1089,6 +1158,16 @@ extern "C" {
     // Get the backend sampled token for the ith token.
     // Returns LLAMA_TOKEN_NULL if no token was sampled.
     LLAMA_API llama_token llama_get_sampled_token_ith(struct llama_context * ctx, int32_t i);
+
+    // Force raw logits to be copied to host even when every output sequence
+    // has a backend sampler. This can be changed between decode calls.
+    LLAMA_API void llama_set_raw_logits_required(struct llama_context * ctx, bool required);
+
+    // Capture argmax(logits row 0) into a persistent device slot. The next
+    // decode can consume that slot as token row 1 without a host round trip.
+    LLAMA_API void llama_set_capture_first_output_argmax(struct llama_context * ctx, bool enabled);
+    LLAMA_API void llama_use_captured_argmax_as_second_token(struct llama_context * ctx, bool enabled);
+    LLAMA_API llama_token llama_get_captured_first_output_argmax(struct llama_context * ctx);
 
     // Get the backend sampled probabilities for the ith token
     // The index matches llama_get_sampled_token_ith().

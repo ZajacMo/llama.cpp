@@ -1674,6 +1674,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (getenv("COSPEC_COMPARE_TREE_CANONICAL_BLOCK") != nullptr) {
+            static int callback_checks = 0;
+            if (sched->callback_eval != nullptr || callback_checks++ < 20) {
+                fprintf(stderr, "[TREE_CANONICAL_BLOCK] backend split cb=%p nodes=%d\n",
+                        reinterpret_cast<void *>(sched->callback_eval), split->graph.n_nodes);
+            }
+        }
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {

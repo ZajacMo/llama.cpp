@@ -224,6 +224,8 @@ bool llama_batch_allocr::init(
             /*.seq_id_unq   =*/ this->seq_id_unq.data(),
             /*.seq_idx      =*/ this->seq_idx.data(),
             /*.output       =*/ batch.logits,
+            /*.batch_idx    =*/ nullptr,
+            /*.tree_node_ids=*/ nullptr,
             /*.data         =*/ {},
         };
 
@@ -406,10 +408,14 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
     udata->seq_id_unq.resize(0);
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
+    udata->batch_idx .resize(n_tokens);
 
     for (uint32_t s = 0; s < n_seqs; ++s) {
         udata->seq_idx[s] = s;
         udata->seq_id_unq.push_back(s);
+    }
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        udata->batch_idx[i] = i;
     }
 
     llama_ubatch res {
@@ -428,6 +434,8 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.batch_idx    =*/ udata->batch_idx.data(),
+        /*.tree_node_ids=*/ nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -696,6 +704,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->seq_id_unq.resize(0);
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
+    udata->batch_idx .resize(n_tokens);
+    if (batch.tree_node_ids) {
+        udata->tree_node_ids.resize(n_tokens);
+    }
 
     udata->seq_id_data.reserve(n_tokens);
 
@@ -721,6 +733,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         udata->n_seq_id[i] = batch.n_seq_id[idxs[i]];
         udata->output[i]   = batch.logits[idxs[i]];
+        udata->batch_idx[i] = idxs[i];
+        if (batch.tree_node_ids) {
+            udata->tree_node_ids[i] = batch.tree_node_ids[idxs[i]];
+        }
 
         for (int s = 0; s < udata->n_seq_id[i]; ++s) {
             const llama_seq_id seq_id = batch.seq_id[idxs[i]][s];
@@ -763,6 +779,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.batch_idx    =*/ udata->batch_idx.data(),
+        /*.tree_node_ids=*/ batch.tree_node_ids ? udata->tree_node_ids.data() : nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -871,6 +889,7 @@ struct llama_batch llama_batch_get_one(
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*tree_node_ids=*/ nullptr,
     };
 }
 
@@ -883,6 +902,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*tree_node_ids=*/ nullptr,
     };
 
     if (embd) {
@@ -900,6 +920,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
     batch.seq_id[n_tokens_alloc] = nullptr;
 
     batch.logits   = (int8_t *)        malloc(sizeof(int8_t)         * n_tokens_alloc);
+    batch.tree_node_ids = nullptr;
 
     return batch;
 }
@@ -916,4 +937,5 @@ void llama_batch_free(struct llama_batch batch) {
         free(batch.seq_id);
     }
     if (batch.logits)   free(batch.logits);
+    if (batch.tree_node_ids) free(batch.tree_node_ids);
 }

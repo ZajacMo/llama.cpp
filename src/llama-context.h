@@ -85,6 +85,8 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    bool project_embeddings(const float * embeddings, int32_t n_rows, float * logits_out);
+
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
@@ -254,6 +256,10 @@ public:
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    void set_raw_logits_required(bool required);
+    void set_capture_first_output_argmax(bool enabled);
+    void use_captured_argmax_as_second_token(bool enabled);
+    llama_token get_captured_first_output_argmax();
 
 private:
     llm_graph_params graph_params(
@@ -307,6 +313,7 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+        bool raw_logits_required = false;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
@@ -345,6 +352,17 @@ private:
 
     bool sched_need_reserve = true;
 
+    struct projection_cache {
+        std::vector<uint8_t> meta;
+        ggml_context_ptr ctx;
+        ggml_backend_sched_ptr sched;
+        ggml_tensor * inp = nullptr;
+        ggml_tensor * out = nullptr;
+        ggml_cgraph * gf = nullptr;
+    };
+
+    std::map<int32_t, projection_cache> projection_caches;
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
@@ -369,6 +387,13 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    ggml_context_ptr captured_argmax_ctx;
+    ggml_backend_buffer_ptr captured_argmax_buf;
+    ggml_tensor * captured_argmax = nullptr;
+    ggml_backend_t captured_argmax_backend = nullptr;
+    bool capture_first_output_argmax_armed = false;
+    bool use_captured_argmax_second_token = false;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

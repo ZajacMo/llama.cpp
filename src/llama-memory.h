@@ -13,6 +13,7 @@ class llama_batch_allocr;
 
 class llama_io_write_i;
 class llama_io_read_i;
+struct llama_context;
 
 struct llama_memory_params {
     // kv cache
@@ -112,6 +113,71 @@ struct llama_memory_i {
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
+    virtual bool seq_commit_tree(
+            llama_seq_id seq_id,
+            int32_t n_nodes,
+            const int32_t * path_node_ids,
+            int32_t path_len) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(n_nodes);
+        GGML_UNUSED(path_node_ids);
+        GGML_UNUSED(path_len);
+        return false;
+    }
+    virtual bool seq_commit_tree_rooted(
+            llama_seq_id seq_id,
+            llama_pos root_pos,
+            int32_t n_nodes,
+            const int32_t * path_node_ids,
+            int32_t path_len) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(root_pos);
+        GGML_UNUSED(n_nodes);
+        GGML_UNUSED(path_node_ids);
+        GGML_UNUSED(path_len);
+        return false;
+    }
+    virtual bool seq_commit_tree_rooted_compact(
+            llama_context * lctx,
+            llama_seq_id seq_id,
+            llama_pos root_pos,
+            int32_t n_nodes,
+            const int32_t * path_node_ids,
+            int32_t path_len) {
+        GGML_UNUSED(lctx);
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(root_pos);
+        GGML_UNUSED(n_nodes);
+        GGML_UNUSED(path_node_ids);
+        GGML_UNUSED(path_len);
+        return false;
+    }
+    virtual bool debug_k_hash(
+            llama_seq_id seq_id,
+            int32_t layer,
+            int32_t tree_node_id,
+            llama_pos pos,
+            uint64_t * hash) const {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(layer);
+        GGML_UNUSED(tree_node_id);
+        GGML_UNUSED(pos);
+        GGML_UNUSED(hash);
+        return false;
+    }
+    virtual bool debug_v_hash(
+            llama_seq_id seq_id,
+            int32_t layer,
+            int32_t tree_node_id,
+            llama_pos pos,
+            uint64_t * hash) const {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(layer);
+        GGML_UNUSED(tree_node_id);
+        GGML_UNUSED(pos);
+        GGML_UNUSED(hash);
+        return false;
+    }
 
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;

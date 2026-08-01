@@ -324,12 +324,17 @@ public:
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    ggml_tensor * get_tree_gather_idxs() const { return tree_gather_idxs; }
+    ggml_tensor * get_tree_gather_mask() const { return tree_gather_mask; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    ggml_tensor * tree_gather_idxs = nullptr; // I32 [n_kv, n_batch]
+    ggml_tensor * tree_gather_mask = nullptr; // F32 [n_kv, n_batch]
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -786,6 +791,7 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_first_output_argmax() const { return t_first_output_argmax; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -817,6 +823,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_first_output_argmax = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -933,7 +940,8 @@ struct llm_graph_context {
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+                     bool   split_sequences = true) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
@@ -1052,8 +1060,25 @@ struct llm_graph_context {
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+            ggml_tensor * tree_gather_idxs,
+            ggml_tensor * tree_gather_mask,
                   float   kq_scale,
                     int   il) const;
+
+    ggml_tensor * build_attn_mha(
+            ggml_tensor * q,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            ggml_tensor * kq_b,
+            ggml_tensor * kq_mask,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il) const {
+        return build_attn_mha(
+            q, k, v, kq_b, kq_mask, sinks, v_mla,
+            nullptr, nullptr, kq_scale, il);
+    }
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

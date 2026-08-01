@@ -139,6 +139,19 @@ public:
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+    bool seq_commit_tree(llama_seq_id seq_id, int32_t n_nodes,
+                         const int32_t * path_node_ids, int32_t path_len) override;
+    bool seq_commit_tree_rooted(llama_seq_id seq_id, llama_pos root_pos,
+                                int32_t n_nodes, const int32_t * path_node_ids,
+                                int32_t path_len) override;
+    bool seq_commit_tree_rooted_compact(llama_context * lctx, llama_seq_id seq_id,
+                                        llama_pos root_pos, int32_t n_nodes,
+                                        const int32_t * path_node_ids,
+                                        int32_t path_len) override;
+    bool debug_k_hash(llama_seq_id seq_id, int32_t layer, int32_t tree_node_id,
+                      llama_pos pos, uint64_t * hash) const override;
+    bool debug_v_hash(llama_seq_id seq_id, int32_t layer, int32_t tree_node_id,
+                      llama_pos pos, uint64_t * hash) const override;
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
@@ -212,14 +225,23 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
+    void set_tree_nodes(const llama_ubatch & ubatch, const slot_info & sinfo, const llama_tree_spec * tree_spec);
+
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
-    void set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_tree_spec * tree_spec) const;
+    void set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+                                     const llama_tree_spec * tree_spec) const;
+    void set_input_tree_ancestor_gather(ggml_tensor * idxs, ggml_tensor * mask,
+                                        const llama_ubatch * ubatch,
+                                        const llama_tree_spec * tree_spec) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
 private:
+    bool seq_commit_tree_impl(llama_seq_id seq_id, llama_pos root_pos,
+                              int32_t n_nodes, const int32_t * path_node_ids,
+                              int32_t path_len, bool canonical_root);
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -397,6 +419,9 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_tree_spec * tree_spec) const;
+    void set_input_tree_ancestor_gather(ggml_tensor * idxs, ggml_tensor * mask,
+                                        const llama_ubatch * ubatch,
+                                        const llama_tree_spec * tree_spec) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

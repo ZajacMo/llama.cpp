@@ -61,6 +61,18 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
+static int64_t tree_gather_width(
+        const llama_ubatch & ubatch,
+        const llama_kv_cache_context * mctx) {
+    int64_t width = 1;
+    if (ubatch.pos) {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            width = std::max<int64_t>(width, static_cast<int64_t>(ubatch.pos[i]) + 1);
+        }
+    }
+    return std::min<int64_t>(width, mctx->get_n_kv());
+}
+
 // impl
 
 static ggml_tensor * ggml_mul_mat_aux(
@@ -494,6 +506,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_kq_mask_with_tree(self_kq_mask, ubatch, cparams.causal_attn, cparams.tree_spec);
     }
 
+    if (tree_gather_idxs && tree_gather_mask) {
+        mctx->set_input_tree_ancestor_gather(
+            tree_gather_idxs, tree_gather_mask, ubatch, cparams.tree_spec);
+    }
+
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -514,6 +531,10 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    res &= (!tree_gather_idxs) ||
+        (tree_gather_idxs->ne[0] == tree_gather_width(params.ubatch, mctx) &&
+         tree_gather_idxs->ne[1] == params.ubatch.n_tokens &&
+         params.cparams.tree_spec != nullptr);
 
     return res;
 }
@@ -1192,6 +1213,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_first_output_argmax = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1236,6 +1258,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    if (t_first_output_argmax != nullptr) {
+        ggml_set_output(t_first_output_argmax);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -1373,7 +1398,38 @@ ggml_tensor * llm_graph_context::build_cvec(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+                 bool   allow_split_sequences) const {
+    const bool split_sequences = allow_split_sequences &&
+        std::getenv("COSPEC_MATMUL_SPLIT_SEQUENCES") != nullptr &&
+        ubatch.n_seqs_unq > 1 && ubatch.n_seq_tokens > 0 &&
+        cur->ne[1] == n_tokens && cur->ne[2] == 1 && cur->ne[3] == 1;
+    if (split_sequences) {
+        const int64_t group = ubatch.n_seq_tokens;
+        const int64_t n_groups = cur->ne[1] / group;
+        if (n_groups * group == cur->ne[1] && loras->empty()) {
+            ggml_tensor * grouped = ggml_reshape_3d(
+                ctx0, cur, cur->ne[0], group, n_groups);
+            ggml_tensor * projected = ggml_mul_mat(ctx0, w, grouped);
+            if (w_s) {
+                projected = ggml_mul(ctx0, projected, w_s);
+            }
+            return ggml_reshape_2d(
+                ctx0, projected, projected->ne[0], cur->ne[1]);
+        }
+
+        ggml_tensor * combined = nullptr;
+        for (int64_t start = 0; start < cur->ne[1]; start += group) {
+            const int64_t width = std::min<int64_t>(group, cur->ne[1] - start);
+            ggml_tensor * lane = ggml_view_2d(ctx0, cur, cur->ne[0], width,
+                                              cur->nb[1], start * cur->nb[1]);
+            ggml_tensor * projected = build_lora_mm(w, lane, w_s);
+            combined = combined ? ggml_concat(ctx0, combined, projected, 1)
+                                : projected;
+        }
+        return combined;
+    }
+
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     if (w_s) {
@@ -1484,12 +1540,25 @@ llm_graph_qkv llm_graph_context::build_qkv(
                       int   il) const {
     const int64_t n_embd_q  = n_embd_head * n_head;
     const int64_t n_embd_kv = n_embd_head * n_head_kv;
+    const bool split_qkv =
+        std::getenv("COSPEC_QKV_SPLIT_TOKENS") != nullptr && n_tokens <= 18;
 
     ggml_tensor * Qcur, * Kcur, * Vcur;
 
     if (layer.wqkv) {
         // fused QKV path
-        ggml_tensor * qkv = build_lora_mm(layer.wqkv, cur, layer.wqkv_s);
+        ggml_tensor * qkv = nullptr;
+        if (!split_qkv) {
+            qkv = build_lora_mm(layer.wqkv, cur, layer.wqkv_s);
+        } else {
+            for (int64_t token = 0; token < cur->ne[1]; ++token) {
+                ggml_tensor * one = ggml_view_2d(
+                    ctx0, cur, cur->ne[0], 1, cur->nb[1],
+                    static_cast<size_t>(token) * cur->nb[1]);
+                ggml_tensor * projected = build_lora_mm(layer.wqkv, one, layer.wqkv_s);
+                qkv = qkv ? ggml_concat(ctx0, qkv, projected, 1) : projected;
+            }
+        }
         cb(qkv, "wqkv", il);
         if (layer.wqkv_b) {
             qkv = ggml_add(ctx0, qkv, layer.wqkv_b);
@@ -1509,7 +1578,22 @@ llm_graph_qkv llm_graph_context::build_qkv(
             ggml_row_size(qkv->type, n_embd_q + n_embd_kv));
     } else {
         // separate Q/K/V path
-        Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
+        auto project = [&](ggml_tensor * weight, ggml_tensor * scale) {
+            if (!split_qkv) {
+                return build_lora_mm(weight, cur, scale);
+            }
+            ggml_tensor * combined = nullptr;
+            for (int64_t token = 0; token < cur->ne[1]; ++token) {
+                ggml_tensor * one = ggml_view_2d(
+                    ctx0, cur, cur->ne[0], 1, cur->nb[1],
+                    static_cast<size_t>(token) * cur->nb[1]);
+                ggml_tensor * projected = build_lora_mm(weight, one, scale);
+                combined = combined ? ggml_concat(ctx0, combined, projected, 1) : projected;
+            }
+            return combined;
+        };
+
+        Qcur = project(layer.wq, layer.wq_s);
         cb(Qcur, "Qcur", il);
         if (layer.wq_b) {
             Qcur = ggml_add(ctx0, Qcur, layer.wq_b);
@@ -1519,7 +1603,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Qcur = ggml_clamp(ctx0, Qcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Qcur, "Qcur_clamped", il);
         }
-        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = project(layer.wk, layer.wk_s);
         cb(Kcur, "Kcur", il);
         if (layer.wk_b) {
             Kcur = ggml_add(ctx0, Kcur, layer.wk_b);
@@ -1529,7 +1613,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Kcur = ggml_clamp(ctx0, Kcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Kcur, "Kcur_clamped", il);
         }
-        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = project(layer.wv, layer.wv_s);
         cb(Vcur, "Vcur", il);
         if (layer.wv_b) {
             Vcur = ggml_add(ctx0, Vcur, layer.wv_b);
@@ -2380,9 +2464,168 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * kq_mask,
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
+         ggml_tensor * tree_gather_idxs,
+         ggml_tensor * tree_gather_mask,
                float   kq_scale,
                  int   il) const {
     const bool v_trans = v->nb[1] > v->nb[2];
+
+    if (tree_gather_idxs) {
+        GGML_ASSERT(tree_gather_mask && kq_b == nullptr && sinks == nullptr &&
+                    v_mla == nullptr && k->ne[3] == 1 && q->ne[2] == ubatch.n_tokens);
+        const int64_t n_kv = tree_gather_idxs->ne[0];
+        const int64_t n_query = tree_gather_idxs->ne[1];
+        const int64_t cache_n_kv = k->ne[2];
+        GGML_ASSERT(n_query == q->ne[2] && n_kv <= cache_n_kv);
+
+        ggml_tensor * k_rows = ggml_reshape_2d(
+            ctx0, k, k->ne[0] * k->ne[1], k->ne[2]);
+        ggml_tensor * v_cells = v;
+        if (v_trans) {
+            v_cells = ggml_permute(ctx0, v, 2, 1, 0, 3);
+        }
+        v_cells = ggml_cont(ctx0, v_cells);
+        v_cells = ggml_reshape_2d(
+            ctx0, v_cells, v_cells->ne[0] * v_cells->ne[1], cache_n_kv);
+
+        ggml_tensor * gather_idxs_flat = ggml_reshape_1d(
+            ctx0, tree_gather_idxs, n_kv * n_query);
+        ggml_tensor * k_gather = ggml_get_rows(ctx0, k_rows, gather_idxs_flat);
+        if (k_gather->type != k->type) {
+            k_gather = ggml_cast(ctx0, k_gather, k->type);
+        }
+        k_gather = ggml_reshape_4d(
+            ctx0, k_gather, k->ne[0], k->ne[1], n_kv, n_query);
+        k_gather = ggml_permute(ctx0, k_gather, 0, 2, 1, 3);
+
+        ggml_tensor * v_gather = ggml_get_rows(ctx0, v_cells, gather_idxs_flat);
+        if (v_gather->type != v->type) {
+            v_gather = ggml_cast(ctx0, v_gather, v->type);
+        }
+        v_gather = ggml_reshape_4d(
+            ctx0, v_gather, v_trans ? v->ne[2] : v->ne[0], v->ne[1], n_kv, n_query);
+        v_gather = ggml_cont(ctx0, ggml_permute(ctx0, v_gather, 1, 2, 0, 3));
+
+        ggml_tensor * q_batch = ggml_reshape_4d(
+            ctx0, q, q->ne[0], q->ne[1], 1, n_query);
+        q_batch = ggml_permute(ctx0, q_batch, 0, 2, 1, 3);
+        ggml_tensor * gather_mask = ggml_reshape_4d(
+            ctx0, tree_gather_mask, n_kv, 1, 1, n_query);
+
+        static int gather_shape_logged = 0;
+        if (gather_shape_logged++ == 0) {
+            fprintf(stderr,
+                    "[COSPEC_ATTN_ANCESTOR_GATHER_SHAPE] q=%lld,%lld,%lld,%lld k=%lld,%lld,%lld,%lld kg=%lld,%lld,%lld,%lld qb=%lld,%lld,%lld,%lld v=%lld,%lld,%lld,%lld vg=%lld,%lld,%lld,%lld mask=%lld,%lld,%lld,%lld\n",
+                    (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
+                    (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3],
+                    (long long) k_gather->ne[0], (long long) k_gather->ne[1], (long long) k_gather->ne[2], (long long) k_gather->ne[3],
+                    (long long) q_batch->ne[0], (long long) q_batch->ne[1], (long long) q_batch->ne[2], (long long) q_batch->ne[3],
+                    (long long) v->ne[0], (long long) v->ne[1], (long long) v->ne[2], (long long) v->ne[3],
+                    (long long) v_gather->ne[0], (long long) v_gather->ne[1], (long long) v_gather->ne[2], (long long) v_gather->ne[3],
+                    (long long) gather_mask->ne[0], (long long) gather_mask->ne[1], (long long) gather_mask->ne[2], (long long) gather_mask->ne[3]);
+        }
+
+        ggml_tensor * out = nullptr;
+        const bool b18_pairs =
+            std::getenv("COSPEC_ATTN_GATHER_B18_PAIRS") != nullptr &&
+            n_query == 17 && cparams.tree_spec && cparams.tree_spec->n_nodes == 17 &&
+            cparams.tree_spec->parent_ids[0] < 0 &&
+            std::all_of(cparams.tree_spec->parent_ids + 1,
+                        cparams.tree_spec->parent_ids + 17,
+                        [](int32_t parent) { return parent == 0; });
+        if (b18_pairs) {
+            constexpr int64_t n_lanes = 16;
+            ggml_tensor * k_lanes = ggml_view_4d(
+                ctx0, k_gather, k_gather->ne[0], n_kv, k_gather->ne[2], n_lanes,
+                k_gather->nb[1], k_gather->nb[2], k_gather->nb[3], k_gather->nb[3]);
+            ggml_tensor * v_lanes = ggml_view_4d(
+                ctx0, v_gather, n_kv, v_gather->ne[1], v_gather->ne[2], n_lanes,
+                v_gather->nb[1], v_gather->nb[2], v_gather->nb[3], v_gather->nb[3]);
+            ggml_tensor * q_root = ggml_view_4d(
+                ctx0, q_batch, q_batch->ne[0], 1, q_batch->ne[2], 1,
+                q_batch->nb[1], q_batch->nb[2], q_batch->nb[3], 0);
+            ggml_tensor * q_leaves = ggml_view_4d(
+                ctx0, q_batch, q_batch->ne[0], 1, q_batch->ne[2], n_lanes,
+                q_batch->nb[1], q_batch->nb[2], q_batch->nb[3], q_batch->nb[3]);
+            q_root = ggml_repeat(ctx0, q_root, q_leaves);
+            ggml_tensor * q_pairs = ggml_concat(ctx0, q_root, q_leaves, 1);
+
+            ggml_tensor * mask_root = ggml_view_4d(
+                ctx0, gather_mask, n_kv, 1, 1, 1,
+                gather_mask->nb[1], gather_mask->nb[2], gather_mask->nb[3], 0);
+            ggml_tensor * mask_leaves = ggml_view_4d(
+                ctx0, gather_mask, n_kv, 1, 1, n_lanes,
+                gather_mask->nb[1], gather_mask->nb[2], gather_mask->nb[3], gather_mask->nb[3]);
+            mask_root = ggml_repeat(ctx0, mask_root, mask_leaves);
+            ggml_tensor * mask_pairs = ggml_concat(ctx0, mask_root, mask_leaves, 1);
+
+            k_lanes = ggml_cont(ctx0, k_lanes);
+            v_lanes = ggml_cont(ctx0, v_lanes);
+            q_pairs = ggml_cont(ctx0, q_pairs);
+            mask_pairs = ggml_cont(ctx0, mask_pairs);
+
+            ggml_tensor * kq = ggml_mul_mat(ctx0, k_lanes, q_pairs);
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+            kq = ggml_soft_max_ext(
+                ctx0, kq, mask_pairs, kq_scale, hparams.f_max_alibi_bias);
+            ggml_tensor * kqv = ggml_mul_mat(ctx0, v_lanes, kq);
+            ggml_tensor * paired = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+            paired = ggml_cont_3d(
+                ctx0, paired, paired->ne[0] * paired->ne[1], 2, n_lanes);
+            ggml_tensor * root_row = ggml_view_2d(
+                ctx0, paired, paired->ne[0], 1, paired->nb[1], 0);
+            ggml_tensor * lane_major = ggml_cont(
+                ctx0, ggml_permute(ctx0, paired, 0, 2, 1, 3));
+            ggml_tensor * leaf_rows = ggml_view_2d(
+                ctx0, lane_major, lane_major->ne[0], n_lanes,
+                lane_major->nb[1], lane_major->nb[2]);
+            out = ggml_concat(ctx0, root_row, leaf_rows, 1);
+        } else if (std::getenv("COSPEC_ATTN_GATHER_SPLIT_QUERIES") != nullptr) {
+            for (int64_t query = 0; query < n_query; ++query) {
+                const int64_t visible_kv = std::min<int64_t>(
+                    n_kv, static_cast<int64_t>(ubatch.pos[query]) + 1);
+                ggml_tensor * k_one = ggml_view_4d(
+                    ctx0, k_gather, k_gather->ne[0], visible_kv, k_gather->ne[2], 1,
+                    k_gather->nb[1], k_gather->nb[2], k_gather->nb[3],
+                    static_cast<size_t>(query) * k_gather->nb[3]);
+                ggml_tensor * v_one = ggml_view_4d(
+                    ctx0, v_gather, visible_kv, v_gather->ne[1], v_gather->ne[2], 1,
+                    v_gather->nb[1], v_gather->nb[2], v_gather->nb[3],
+                    static_cast<size_t>(query) * v_gather->nb[3]);
+                ggml_tensor * q_one = ggml_view_4d(
+                    ctx0, q_batch, q_batch->ne[0], 1, q_batch->ne[2], 1,
+                    q_batch->nb[1], q_batch->nb[2], q_batch->nb[3],
+                    static_cast<size_t>(query) * q_batch->nb[3]);
+                ggml_tensor * mask_one = ggml_view_4d(
+                    ctx0, gather_mask, visible_kv, 1, 1, 1,
+                    gather_mask->nb[1], gather_mask->nb[2], gather_mask->nb[3],
+                    static_cast<size_t>(query) * gather_mask->nb[3]);
+
+                k_one = ggml_cont(ctx0, k_one);
+                v_one = ggml_cont(ctx0, v_one);
+                q_one = ggml_cont(ctx0, q_one);
+
+                ggml_tensor * kq_one = ggml_mul_mat(ctx0, k_one, q_one);
+                ggml_mul_mat_set_prec(kq_one, GGML_PREC_F32);
+                kq_one = ggml_soft_max_ext(
+                    ctx0, kq_one, mask_one, kq_scale, hparams.f_max_alibi_bias);
+                ggml_tensor * kqv_one = ggml_mul_mat(ctx0, v_one, kq_one);
+                ggml_tensor * row = ggml_permute(ctx0, kqv_one, 0, 2, 1, 3);
+                row = ggml_cont_2d(ctx0, row, row->ne[0] * row->ne[1], 1);
+                out = out ? ggml_concat(ctx0, out, row, 1) : row;
+            }
+        } else {
+            ggml_tensor * kq = ggml_mul_mat(ctx0, k_gather, q_batch);
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+            kq = ggml_soft_max_ext(
+                ctx0, kq, gather_mask, kq_scale, hparams.f_max_alibi_bias);
+            ggml_tensor * kqv = ggml_mul_mat(ctx0, v_gather, kq);
+            out = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+            out = ggml_cont_2d(ctx0, out, out->ne[0] * out->ne[1], n_query);
+        }
+        ggml_build_forward_expand(gf, out);
+        return out;
+    }
 
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
@@ -2438,7 +2681,138 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
+        const bool canonical_b18_pairs =
+            std::getenv("COSPEC_ATTN_GATHER_B18_PAIRS") != nullptr &&
+            n_tokens == 2 && n_stream == 1 && kq_b == nullptr && sinks == nullptr &&
+            !hparams.attn_soft_cap && arch != LLM_ARCH_GROK;
+        const bool split_queries =
+            std::getenv("COSPEC_ATTN_SPLIT_QUERIES") != nullptr &&
+            n_tokens <= 18 && n_stream == 1 && kq_b == nullptr && sinks == nullptr &&
+            !hparams.attn_soft_cap && arch != LLM_ARCH_GROK;
+        if (canonical_b18_pairs) {
+            constexpr int64_t n_lanes = 16;
+            if (!v_trans) {
+                v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+            }
+
+            if (std::getenv("COSPEC_DEBUG_ATTN_COMPACT_PREFIX") != nullptr &&
+                ubatch.pos != nullptr && ubatch.n_tokens == 2) {
+                const int64_t compact_n_kv = std::min<int64_t>(
+                    std::max<int64_t>(1, static_cast<int64_t>(ubatch.pos[1]) + 1),
+                    k->ne[1]);
+                if (compact_n_kv < k->ne[1]) {
+                    k = ggml_cont(ctx0, ggml_view_4d(
+                        ctx0, k, k->ne[0], compact_n_kv, k->ne[2], k->ne[3],
+                        k->nb[1], k->nb[2], k->nb[3], 0));
+                    v = ggml_cont(ctx0, ggml_view_4d(
+                        ctx0, v, compact_n_kv, v->ne[1], v->ne[2], v->ne[3],
+                        v->nb[1], v->nb[2], v->nb[3], 0));
+                    kq_mask = ggml_view_4d(
+                        ctx0, kq_mask, compact_n_kv, kq_mask->ne[1],
+                        kq_mask->ne[2], kq_mask->ne[3],
+                        kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], 0);
+                }
+            }
+
+            ggml_tensor * q_shape = ggml_new_tensor_4d(
+                ctx0, q->type, q->ne[0], q->ne[1], q->ne[2], n_lanes);
+            ggml_tensor * k_shape = ggml_new_tensor_4d(
+                ctx0, k->type, k->ne[0], k->ne[1], k->ne[2], n_lanes);
+            ggml_tensor * v_shape = ggml_new_tensor_4d(
+                ctx0, v->type, v->ne[0], v->ne[1], v->ne[2], n_lanes);
+            ggml_tensor * mask_shape = ggml_new_tensor_4d(
+                ctx0, kq_mask->type, kq_mask->ne[0], kq_mask->ne[1],
+                kq_mask->ne[2], n_lanes);
+            ggml_tensor * q_lanes = ggml_cont(ctx0, ggml_repeat(ctx0, q, q_shape));
+            ggml_tensor * k_lanes = ggml_cont(ctx0, ggml_repeat(ctx0, k, k_shape));
+            ggml_tensor * v_lanes = ggml_cont(ctx0, ggml_repeat(ctx0, v, v_shape));
+            ggml_tensor * mask_lanes = ggml_cont(
+                ctx0, ggml_repeat(ctx0, kq_mask, mask_shape));
+
+            ggml_tensor * kq = ggml_mul_mat(ctx0, k_lanes, q_lanes);
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+            kq = ggml_soft_max_ext(
+                ctx0, kq, mask_lanes, kq_scale, hparams.f_max_alibi_bias);
+            ggml_tensor * kqv = ggml_mul_mat(ctx0, v_lanes, kq);
+            ggml_tensor * paired = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+            paired = ggml_cont_3d(
+                ctx0, paired, paired->ne[0] * paired->ne[1], n_tokens, n_lanes);
+            cur = ggml_view_2d(
+                ctx0, paired, paired->ne[0], n_tokens, paired->nb[1], 0);
+        } else if (split_queries) {
+            const bool split_core_cpu =
+                std::getenv("COSPEC_DEBUG_ATTN_CORE_CPU") != nullptr;
+            if (!v_trans) {
+                v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+            }
+
+            ggml_tensor * combined = nullptr;
+            for (int64_t query = 0; query < q->ne[1]; ++query) {
+                ggml_tensor * k_one = k;
+                ggml_tensor * v_one = v;
+                ggml_tensor * mask_src = kq_mask;
+                if (std::getenv("COSPEC_DEBUG_ATTN_COMPACT_PREFIX") != nullptr &&
+                    ubatch.pos != nullptr && query < ubatch.n_tokens) {
+                    const int64_t logical_n_kv = std::max<int64_t>(
+                        1, static_cast<int64_t>(ubatch.pos[query]) + 1);
+                    const int64_t compact_n_kv = std::min<int64_t>(
+                        logical_n_kv, k->ne[1]);
+                    if (compact_n_kv < k->ne[1]) {
+                        k_one = ggml_view_4d(
+                            ctx0, k, k->ne[0], compact_n_kv, k->ne[2], k->ne[3],
+                            k->nb[1], k->nb[2], k->nb[3], 0);
+                        v_one = ggml_view_4d(
+                            ctx0, v, compact_n_kv, v->ne[1], v->ne[2], v->ne[3],
+                            v->nb[1], v->nb[2], v->nb[3], 0);
+                        mask_src = ggml_view_4d(
+                            ctx0, kq_mask, compact_n_kv, kq_mask->ne[1],
+                            kq_mask->ne[2], kq_mask->ne[3],
+                            kq_mask->nb[1], kq_mask->nb[2],
+                            kq_mask->nb[3], 0);
+                        k_one = ggml_cont(ctx0, k_one);
+                        v_one = ggml_cont(ctx0, v_one);
+                    }
+                }
+                ggml_tensor * q_one = ggml_view_4d(
+                    ctx0, q, q->ne[0], 1, q->ne[2], q->ne[3],
+                    q->nb[1], q->nb[2], q->nb[3],
+                    static_cast<size_t>(query) * q->nb[1]);
+                if (std::getenv("COSPEC_DEBUG_ATTN_COMPACT_PREFIX") != nullptr) {
+                    q_one = ggml_cont(ctx0, q_one);
+                }
+                ggml_tensor * mask_one = ggml_view_4d(
+                    ctx0, mask_src, mask_src->ne[0], 1, mask_src->ne[2], mask_src->ne[3],
+                    mask_src->nb[1], mask_src->nb[2], mask_src->nb[3],
+                    static_cast<size_t>(query) * mask_src->nb[1]);
+
+                ggml_tensor * kq_one = ggml_mul_mat(ctx0, k_one, q_one);
+                if (split_core_cpu) {
+                    ggml_backend_sched_set_tensor_backend(sched, kq_one, backend_cpu);
+                }
+                ggml_mul_mat_set_prec(kq_one, GGML_PREC_F32);
+                kq_one = ggml_soft_max_ext(
+                    ctx0, kq_one, mask_one, kq_scale, hparams.f_max_alibi_bias);
+                if (split_core_cpu) {
+                    ggml_backend_sched_set_tensor_backend(sched, kq_one, backend_cpu);
+                }
+
+                ggml_tensor * kqv_one = ggml_mul_mat(ctx0, v_one, kq_one);
+                if (split_core_cpu) {
+                    ggml_backend_sched_set_tensor_backend(sched, kqv_one, backend_cpu);
+                }
+                ggml_tensor * row = ggml_permute(ctx0, kqv_one, 0, 2, 1, 3);
+                row = ggml_cont_2d(
+                    ctx0, row, row->ne[0] * row->ne[1], row->ne[2] * row->ne[3]);
+                combined = combined ? ggml_concat(ctx0, combined, row, 1) : row;
+            }
+            cur = combined;
+        } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        const bool debug_attn_core_cpu =
+            std::getenv("COSPEC_DEBUG_ATTN_CORE_CPU") != nullptr;
+        if (debug_attn_core_cpu) {
+            ggml_backend_sched_set_tensor_backend(sched, kq, backend_cpu);
+        }
         cb(kq, "kq", il);
 
         // note: this op tends to require high floating point range
@@ -2473,6 +2847,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+        if (debug_attn_core_cpu) {
+            ggml_backend_sched_set_tensor_backend(sched, kq, backend_cpu);
+        }
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
 
@@ -2483,6 +2860,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+        if (debug_attn_core_cpu) {
+            ggml_backend_sched_set_tensor_backend(sched, kqv, backend_cpu);
+        }
+        if (std::getenv("COSPEC_ATTN_KQV_F32") != nullptr) {
+            ggml_mul_mat_set_prec(kqv, GGML_PREC_F32);
+        }
         cb(kqv, "kqv", il);
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
@@ -2499,6 +2882,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (!cparams.offload_kqv) {
             // all nodes between the KV store and the attention output are run on the CPU
             ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+        }
         }
     }
 
@@ -2566,7 +2950,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(
+        q, k, v, kq_b, kq_mask, sinks, v_mla, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -2601,6 +2986,27 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        const bool ancestor_gather =
+            std::getenv("COSPEC_ATTN_ANCESTOR_GATHER") != nullptr &&
+            cparams.tree_spec != nullptr && cparams.tree_spec->parent_ids != nullptr &&
+            cparams.tree_spec->n_nodes == static_cast<int32_t>(ubatch.n_tokens) &&
+            !cparams.flash_attn && ubatch.n_seqs_unq == 1 &&
+            ubatch.n_tokens >= 2 && ubatch.n_tokens <= 18;
+        if (ancestor_gather) {
+            const int64_t n_kv = tree_gather_width(ubatch, mctx_cur);
+            inp->tree_gather_idxs = ggml_new_tensor_2d(
+                ctx0, GGML_TYPE_I32, n_kv, ubatch.n_tokens);
+            inp->tree_gather_mask = ggml_new_tensor_2d(
+                ctx0, GGML_TYPE_F32, n_kv, ubatch.n_tokens);
+            ggml_set_input(inp->tree_gather_idxs);
+            ggml_set_input(inp->tree_gather_mask);
+            static int logged = 0;
+            if (logged++ == 0) {
+                fprintf(stderr, "[COSPEC_ATTN_ANCESTOR_GATHER] active n_kv=%lld queries=%u\n",
+                        static_cast<long long>(n_kv), ubatch.n_tokens);
+            }
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2665,14 +3071,18 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(
+        q, k, v, kq_b, kq_mask, sinks, v_mla,
+        inp->get_tree_gather_idxs(), inp->get_tree_gather_mask(), kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
     }
 
-    if (wo) {
+    const bool skip_wo =
+        il == 0 && std::getenv("COSPEC_DEBUG_SKIP_LAYER0_ATTN_WO") != nullptr;
+    if (wo && !skip_wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             cur = build_lora_mm(wo, cur);
@@ -2683,6 +3093,10 @@ ggml_tensor * llm_graph_context::build_attn(
         } else {
             cur = build_lora_mm(wo, cur, wo_s);
         }
+    } else if (skip_wo) {
+        GGML_ASSERT(cur->ne[0] >= hparams.n_embd && cur->ne[2] == 1 && cur->ne[3] == 1);
+        cur = ggml_view_2d(
+            ctx0, cur, hparams.n_embd, cur->ne[1], cur->nb[1], 0);
     }
 
     if (wo_b) {
@@ -2756,7 +3170,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(
+        q, k, v, kq_b, kq_mask, sinks, v_mla, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -2841,7 +3256,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(
+        q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -2920,7 +3336,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(
+        q, k, v, kq_b, kq_mask, sinks, v_mla, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
@@ -2983,7 +3400,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(
+        q, k, v, kq_b, kq_mask, sinks, v_mla, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -3388,7 +3806,19 @@ void llm_graph_context::build_pooling(
 }
 
 void llm_graph_context::build_sampling() const {
-    if (samplers.empty() || !res->t_logits) {
+    if (!res->t_logits) {
+        return;
+    }
+
+    if (cparams.capture_first_output_argmax) {
+        ggml_tensor * row0 = ggml_view_1d(ctx0, res->t_logits,
+                                         res->t_logits->ne[0], 0);
+        res->t_first_output_argmax = ggml_argmax(ctx0, row0);
+        ggml_set_name(res->t_first_output_argmax, "first_output_argmax");
+        ggml_build_forward_expand(gf, res->t_first_output_argmax);
+    }
+
+    if (samplers.empty()) {
         return;
     }
 

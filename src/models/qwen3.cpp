@@ -58,6 +58,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
+    ggml_tensor * debug_l0_attn_out = nullptr;
 
     inpL = build_inp_embd(model.tok_embd);
 
@@ -67,6 +68,8 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     auto * inp_attn = build_attn_inp_kv();
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+    const bool grouped_hidden_output =
+        cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
 
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -103,36 +106,67 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                     ext_factor, attn_factor, beta_fast, beta_slow
                     );
 
+            if (il == 1 && debug_l0_attn_out != nullptr &&
+                std::getenv("COSPEC_DEBUG_STORE_L0_ATTN_OUT_AS_L1_K") != nullptr) {
+                GGML_ASSERT(debug_l0_attn_out->ne[0] >= n_embd_head * n_head_kv);
+                Kcur = ggml_view_3d(
+                    ctx0, debug_l0_attn_out,
+                    n_embd_head, n_head_kv, n_tokens,
+                    ggml_row_size(debug_l0_attn_out->type, n_embd_head),
+                    debug_l0_attn_out->nb[1], 0);
+            }
+
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
+            if (il == 0 && std::getenv("COSPEC_DEBUG_STORE_V_AS_K") != nullptr) {
+                Kcur = Vcur;
+            } else if (il == 0 && std::getenv("COSPEC_DEBUG_STORE_Q_AS_K") != nullptr) {
+                int q_head_offset = 0;
+                if (const char * value = std::getenv("COSPEC_DEBUG_Q_HEAD_OFFSET")) {
+                    q_head_offset = std::max(0, std::atoi(value));
+                }
+                GGML_ASSERT(q_head_offset + n_head_kv <= n_head);
+                Kcur = ggml_view_3d(
+                    ctx0, Qcur, n_embd_head, n_head_kv, n_tokens,
+                    Qcur->nb[1], Qcur->nb[2],
+                    static_cast<size_t>(q_head_offset) * Qcur->nb[1]);
+            }
+
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            if (il == 0 && std::getenv("COSPEC_DEBUG_STORE_L0_ATTN_OUT_AS_L1_K") != nullptr) {
+                debug_l0_attn_out = cur;
+            }
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && !grouped_hidden_output) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
-        // feed-forward network
-        cur = build_norm(ffn_inp,
-                model.layers[il].ffn_norm, NULL,
-                LLM_NORM_RMS, il);
-        cb(cur, "ffn_norm", il);
+        if (il == 0 && std::getenv("COSPEC_DEBUG_SKIP_QWEN3_LAYER0_FFN") != nullptr) {
+            cur = ffn_inp;
+        } else {
+            // feed-forward network
+            cur = build_norm(ffn_inp,
+                    model.layers[il].ffn_norm, NULL,
+                    LLM_NORM_RMS, il);
+            cb(cur, "ffn_norm", il);
 
-        cur = build_ffn(cur,
-                model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
-                model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
-                model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(cur, "ffn_out", il);
+            cur = build_ffn(cur,
+                    model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
+                    model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+                    model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(cur, "ffn_out", il);
 
-        cur = ggml_add(ctx0, cur, ffn_inp);
+            cur = ggml_add(ctx0, cur, ffn_inp);
+        }
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
@@ -147,10 +181,14 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
             LLM_NORM_RMS, -1);
 
     cb(cur, "result_norm", -1);
+    if (grouped_hidden_output) {
+        res->t_h_nextn = cur;
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur, model.output_s, false);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

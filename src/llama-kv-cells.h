@@ -36,6 +36,7 @@ public:
             pos[i]   = -1;
             ext[i].reset();
             shift[i] =  0;
+            tree_node[i] = -1;
             seq[i].reset();
         }
 
@@ -64,6 +65,7 @@ public:
         pos.resize(n);
         ext.resize(n);
         shift.resize(n);
+        tree_node.resize(n);
         seq.resize(n);
 
         reset();
@@ -129,6 +131,7 @@ public:
 
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
+            res.tree_node[j] = tree_node[idx];
             res.seq[j] = seq[idx];
 
             assert(shift[idx] == 0);
@@ -148,6 +151,7 @@ public:
 
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
+            res.tree_node[j] = tree_node[idx];
             res.seq[j] = seq[idx];
 
             assert(shift[idx] == 0);
@@ -177,6 +181,7 @@ public:
 
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
+            tree_node[idx] = other.tree_node[j];
             seq[idx] = other.seq[j];
 
             if (pos[idx] != -1) {
@@ -208,6 +213,7 @@ public:
 
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
+            tree_node[idx] = other.tree_node[j];
             seq[idx] = other.seq[j];
 
             if (pos[idx] != -1) {
@@ -229,6 +235,7 @@ public:
         pos[i] = -1;
         ext[i].reset();
         shift[i] = 0;
+        tree_node[i] = -1;
 
         used.erase(i);
     }
@@ -248,6 +255,7 @@ public:
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            tree_node[i] = -1;
 
             used.erase(i);
 
@@ -278,6 +286,7 @@ public:
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            tree_node[i] = -1;
 
             used.erase(i);
 
@@ -407,6 +416,17 @@ public:
         ext[i] = p;
     }
 
+    int32_t tree_node_get(uint32_t i) const {
+        assert(i < tree_node.size());
+        return tree_node[i];
+    }
+
+    void tree_node_set(uint32_t i, int32_t node_id) {
+        assert(i < tree_node.size());
+        assert(pos[i] != -1);
+        tree_node[i] = node_id;
+    }
+
     // pos[i] = pos[i] + d
     // sets "has_shift" to true
     // note: call only if the cell is not empty
@@ -425,6 +445,7 @@ public:
             seq[i].reset();
             pos[i] = -1;
             shift[i] = 0;
+            tree_node[i] = -1;
 
             used.erase(i);
 
@@ -482,6 +503,10 @@ private:
     //   }
     //
     std::vector<llama_pos> shift;
+
+    // Transient identity used only while a speculative tree is resident.
+    // A committed path is reset to -1 and becomes ordinary prefix KV.
+    std::vector<int32_t> tree_node;
 
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 

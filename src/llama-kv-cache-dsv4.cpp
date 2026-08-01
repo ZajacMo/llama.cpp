@@ -99,6 +99,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
     data->seq_id_unq.assign(ubatch.seq_id_unq, ubatch.seq_id_unq + ubatch.n_seqs_unq);
     data->seq_idx.assign(LLAMA_MAX_SEQ, -1);
     data->output.assign(n_tokens, 0);
+    data->batch_idx.reserve(n_tokens);
     if (ubatch.token) {
         data->token.reserve(n_tokens);
     }
@@ -123,6 +124,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
             }
             data->n_seq_id.push_back(1);
             data->seq_id_data.push_back(seq_id);
+            data->batch_idx.push_back(ubatch.batch_idx ? ubatch.batch_idx[i] : static_cast<int32_t>(i));
         }
     }
 
@@ -145,6 +147,8 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
         /*.seq_id_unq   =*/ data->seq_id_unq.data(),
         /*.seq_idx      =*/ data->seq_idx.data(),
         /*.output       =*/ data->output.data(),
+        /*.batch_idx    =*/ data->batch_idx.data(),
+        /*.tree_node_ids=*/ nullptr,
         /*.data         =*/ data,
     };
 

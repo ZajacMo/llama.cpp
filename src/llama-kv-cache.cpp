@@ -629,6 +629,384 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     head = new_head != cells.size() ? new_head : 0;
 }
 
+bool llama_kv_cache::seq_commit_tree(
+        llama_seq_id seq_id,
+        int32_t n_nodes,
+        const int32_t * path_node_ids,
+        int32_t path_len) {
+    return seq_commit_tree_impl(
+        seq_id, -1, n_nodes, path_node_ids, path_len, false);
+}
+
+bool llama_kv_cache::seq_commit_tree_rooted(
+        llama_seq_id seq_id,
+        llama_pos root_pos,
+        int32_t n_nodes,
+        const int32_t * path_node_ids,
+        int32_t path_len) {
+    return seq_commit_tree_impl(
+        seq_id, root_pos, n_nodes, path_node_ids, path_len, true);
+}
+
+bool llama_kv_cache::seq_commit_tree_rooted_compact(
+        llama_context * lctx,
+        llama_seq_id seq_id,
+        llama_pos root_pos,
+        int32_t n_nodes,
+        const int32_t * path_node_ids,
+        int32_t path_len) {
+    if (!lctx || other || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() ||
+        root_pos < 0 || n_nodes <= 0 || path_len <= 0 || !path_node_ids) {
+        return false;
+    }
+
+    const uint32_t stream = seq_to_stream[seq_id];
+    auto & cells = v_cells[stream];
+    auto & head = v_heads[stream];
+
+    std::vector<uint32_t> prefix_cells;
+    std::vector<uint32_t> path_cells(static_cast<size_t>(path_len));
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (!cells.is_empty(cell) && cells.seq_has(cell, seq_id) &&
+            cells.tree_node_get(cell) < 0) {
+            prefix_cells.push_back(cell);
+        }
+    }
+    std::stable_sort(prefix_cells.begin(), prefix_cells.end(), [&](uint32_t a, uint32_t b) {
+        return cells.pos_get(a) < cells.pos_get(b);
+    });
+    if (prefix_cells.empty() || cells.pos_get(prefix_cells.back()) != root_pos) {
+        return false;
+    }
+    for (size_t i = 1; i < prefix_cells.size(); ++i) {
+        if (prefix_cells[i] != prefix_cells[i - 1] + 1 ||
+            cells.pos_get(prefix_cells[i]) != cells.pos_get(prefix_cells[i - 1]) + 1) {
+            return false;
+        }
+    }
+
+    std::vector<uint8_t> seen(cells.size(), 0);
+    for (int32_t path_idx = 0; path_idx < path_len; ++path_idx) {
+        const int32_t node_id = path_node_ids[path_idx];
+        if (node_id < 0 || node_id >= n_nodes) {
+            return false;
+        }
+        int matches = 0;
+        uint32_t source_cell = cells.size();
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (!cells.is_empty(cell) && cells.seq_has(cell, seq_id) &&
+                cells.tree_node_get(cell) == node_id) {
+                source_cell = cell;
+                ++matches;
+            }
+        }
+        if (matches != 1 || seen[source_cell]) {
+            return false;
+        }
+        seen[source_cell] = 1;
+        path_cells[static_cast<size_t>(path_idx)] = source_cell;
+    }
+
+    const uint32_t target_start = prefix_cells.back() + 1;
+    if (target_start + static_cast<uint32_t>(path_len) > cells.size()) {
+        return false;
+    }
+    for (uint32_t target = target_start;
+         target < target_start + static_cast<uint32_t>(path_len); ++target) {
+        if (!cells.is_empty(target) && cells.seq_has(target, seq_id) &&
+            cells.tree_node_get(target) < 0) {
+            return false;
+        }
+    }
+
+    auto * sched = lctx->get_sched();
+    ggml_backend_sched_reset(sched);
+    auto * res = lctx->get_gf_res_reserve();
+    res->reset();
+    auto * ctx = res->get_ctx();
+    auto * gf = res->get_gf();
+
+    struct index_input {
+        ggml_tensor * tensor;
+        std::vector<int32_t> values;
+    };
+    std::vector<index_input> inputs;
+    auto make_indices = [&](std::vector<int32_t> values) {
+        ggml_tensor * tensor = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_I32, static_cast<int64_t>(values.size()));
+        ggml_set_input(tensor);
+        inputs.push_back({tensor, std::move(values)});
+        return tensor;
+    };
+
+    std::vector<int32_t> source_rows(path_cells.begin(), path_cells.end());
+    std::vector<int32_t> target_rows(static_cast<size_t>(path_len));
+    for (int32_t i = 0; i < path_len; ++i) {
+        target_rows[static_cast<size_t>(i)] = static_cast<int32_t>(target_start) + i;
+    }
+
+    for (const auto & layer : layers) {
+        ggml_tensor * k = layer.k_stream[stream];
+        ggml_tensor * k_src = make_indices(source_rows);
+        ggml_tensor * k_dst = make_indices(target_rows);
+        ggml_tensor * k_rows = ggml_get_rows(ctx, k, k_src);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, k, k_rows, k_dst));
+
+        ggml_tensor * v = layer.v_stream[stream];
+        if (!v) {
+            continue;
+        }
+        if (!v_trans) {
+            ggml_tensor * v_src = make_indices(source_rows);
+            ggml_tensor * v_dst = make_indices(target_rows);
+            ggml_tensor * v_rows = ggml_get_rows(ctx, v, v_src);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx, v, v_rows, v_dst));
+        } else {
+            const int64_t n_embd = v->ne[1];
+            const int64_t kv_size = cells.size();
+            std::vector<int32_t> v_source;
+            std::vector<int32_t> v_target;
+            v_source.reserve(static_cast<size_t>(n_embd * path_len));
+            v_target.reserve(static_cast<size_t>(n_embd * path_len));
+            for (int64_t embd = 0; embd < n_embd; ++embd) {
+                for (int32_t i = 0; i < path_len; ++i) {
+                    v_source.push_back(static_cast<int32_t>(embd * kv_size + path_cells[static_cast<size_t>(i)]));
+                    v_target.push_back(static_cast<int32_t>(embd * kv_size + target_start + i));
+                }
+            }
+            ggml_tensor * v_flat = ggml_reshape_2d(ctx, v, 1, ggml_nelements(v));
+            ggml_tensor * v_src = make_indices(std::move(v_source));
+            ggml_tensor * v_dst = make_indices(std::move(v_target));
+            ggml_tensor * v_rows = ggml_get_rows(ctx, v_flat, v_src);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_flat, v_rows, v_dst));
+        }
+    }
+
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        return false;
+    }
+    for (const auto & input : inputs) {
+        ggml_backend_tensor_set(input.tensor, input.values.data(), 0,
+                                input.values.size() * sizeof(int32_t));
+    }
+    if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    const llama_kv_cells path_metadata = cells.cp(path_cells);
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (!cells.is_empty(cell) && cells.seq_has(cell, seq_id) &&
+            cells.tree_node_get(cell) >= 0) {
+            cells.seq_rm(cell, seq_id);
+        }
+    }
+    cells.set(target_start, path_metadata);
+    for (int32_t i = 0; i < path_len; ++i) {
+        cells.tree_node_set(target_start + static_cast<uint32_t>(i), -1);
+    }
+    head = target_start + static_cast<uint32_t>(path_len);
+    if (head >= cells.size()) {
+        head = 0;
+    }
+    return true;
+}
+
+bool llama_kv_cache::seq_commit_tree_impl(
+        llama_seq_id seq_id,
+        llama_pos root_pos,
+        int32_t n_nodes,
+        const int32_t * path_node_ids,
+        int32_t path_len,
+        bool canonical_root) {
+    if (other || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() ||
+        n_nodes <= 0 || path_len < 0 || (canonical_root && root_pos < 0) ||
+        (path_len > 0 && path_node_ids == nullptr)) {
+        return false;
+    }
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+    auto & head  = v_heads[seq_to_stream[seq_id]];
+
+    std::vector<uint32_t> path_cells(static_cast<size_t>(path_len));
+    std::vector<uint8_t> keep(cells.size(), 0);
+
+    uint32_t root_cell = cells.size();
+    int root_matches = 0;
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (cells.is_empty(cell) || !cells.seq_has(cell, seq_id)) {
+            continue;
+        }
+        const bool is_root = canonical_root
+            ? cells.tree_node_get(cell) < 0 && cells.pos_get(cell) == root_pos
+            : cells.tree_node_get(cell) == 0;
+        if (is_root) {
+            keep[cell] = 1;
+            root_cell = cell;
+            ++root_matches;
+        }
+    }
+    if (root_matches != 1) {
+        return false;
+    }
+
+    for (int32_t path_idx = 0; path_idx < path_len; ++path_idx) {
+        const int32_t node_id = path_node_ids[path_idx];
+        if ((!canonical_root && node_id <= 0) || node_id < 0 || node_id >= n_nodes) {
+            return false;
+        }
+        int matches = 0;
+        uint32_t source_cell = 0;
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (!cells.is_empty(cell) && cells.seq_has(cell, seq_id) &&
+                cells.tree_node_get(cell) == node_id) {
+                source_cell = cell;
+                ++matches;
+            }
+        }
+        if (matches != 1 || keep[source_cell]) {
+            return false;
+        }
+        path_cells[static_cast<size_t>(path_idx)] = source_cell;
+        keep[source_cell] = 1;
+    }
+
+    uint32_t new_head = cells.size();
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (cells.is_empty(cell) || !cells.seq_has(cell, seq_id) ||
+            cells.tree_node_get(cell) < 0 || keep[cell]) {
+            continue;
+        }
+        if (cells.seq_rm(cell, seq_id) && new_head == cells.size()) {
+            new_head = cell;
+        }
+    }
+
+    cells.tree_node_set(root_cell, -1);
+    for (uint32_t cell : path_cells) {
+        cells.tree_node_set(cell, -1);
+    }
+
+    if (new_head != cells.size() && new_head < head) {
+        head = new_head;
+    }
+    return true;
+}
+
+bool llama_kv_cache::debug_k_hash(
+        llama_seq_id seq_id,
+        int32_t layer,
+        int32_t tree_node_id,
+        llama_pos pos,
+        uint64_t * hash) const {
+    if (!hash || other || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    const auto it = map_layer_ids.find(layer);
+    if (it == map_layer_ids.end()) {
+        return false;
+    }
+
+    const uint32_t stream = seq_to_stream[seq_id];
+    const auto & cells = v_cells[stream];
+    uint32_t selected = cells.size();
+    int matches = 0;
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (cells.is_empty(cell) || !cells.seq_has(cell, seq_id)) {
+            continue;
+        }
+        const bool match = tree_node_id >= 0
+            ? cells.tree_node_get(cell) == tree_node_id
+            : cells.pos_get(cell) == pos;
+        if (match) {
+            selected = cell;
+            ++matches;
+        }
+    }
+    if (matches != 1) {
+        return false;
+    }
+
+    const auto & kv_layer = layers[it->second];
+    ggml_tensor * k = kv_layer.k_stream[stream];
+    const size_t row_size = ggml_row_size(k->type, hparams.n_embd_k_gqa(layer));
+    std::vector<uint8_t> row(row_size);
+    ggml_backend_tensor_get(k, row.data(), static_cast<size_t>(selected) * row_size, row_size);
+
+    uint64_t value = 1469598103934665603ULL;
+    for (uint8_t byte : row) {
+        value ^= byte;
+        value *= 1099511628211ULL;
+    }
+    *hash = value;
+    return true;
+}
+
+bool llama_kv_cache::debug_v_hash(
+        llama_seq_id seq_id,
+        int32_t layer,
+        int32_t tree_node_id,
+        llama_pos pos,
+        uint64_t * hash) const {
+    if (!hash || other || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    const auto it = map_layer_ids.find(layer);
+    if (it == map_layer_ids.end()) {
+        return false;
+    }
+
+    const uint32_t stream = seq_to_stream[seq_id];
+    const auto & cells = v_cells[stream];
+    uint32_t selected = cells.size();
+    int matches = 0;
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (cells.is_empty(cell) || !cells.seq_has(cell, seq_id)) {
+            continue;
+        }
+        const bool match = tree_node_id >= 0
+            ? cells.tree_node_get(cell) == tree_node_id
+            : cells.pos_get(cell) == pos;
+        if (match) {
+            selected = cell;
+            ++matches;
+        }
+    }
+    if (matches != 1) {
+        return false;
+    }
+
+    const auto & kv_layer = layers[it->second];
+    ggml_tensor * v = kv_layer.v_stream[stream];
+    if (!v) {
+        return false;
+    }
+
+    const uint32_t n_embd = hparams.n_embd_v_gqa(layer);
+    const size_t element_size = ggml_type_size(v->type);
+    std::vector<uint8_t> row(static_cast<size_t>(n_embd) * element_size);
+    if (!v_trans) {
+        const size_t row_size = ggml_row_size(v->type, n_embd);
+        row.resize(row_size);
+        ggml_backend_tensor_get(v, row.data(), static_cast<size_t>(selected) * row_size, row_size);
+    } else {
+        for (uint32_t i = 0; i < n_embd; ++i) {
+            const size_t offset =
+                (static_cast<size_t>(i) * cells.size() + selected) * element_size;
+            ggml_backend_tensor_get(
+                v, row.data() + static_cast<size_t>(i) * element_size,
+                offset, element_size);
+        }
+    }
+
+    uint64_t value = 1469598103934665603ULL;
+    for (uint8_t byte : row) {
+        value ^= byte;
+        value *= 1099511628211ULL;
+    }
+    *hash = value;
+    return true;
+}
+
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -1141,6 +1519,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             }
 
             cells.pos_set(idx, ubatch.pos[i]);
+            cells.tree_node_set(idx, -1);
 
             if (ubatch.is_pos_2d()) {
                 llama_kv_cell_ext ext {
@@ -1546,41 +1925,23 @@ struct args_set_input_kq_mask {
     // tree attention spec (for speculative decoding with tree masks)
     const llama_tree_spec * tree_spec;
     bool tree_attn;
-    int tree_offset;  // position in context where tree starts
 };
 
-// Helper function to check if key node j is an ancestor of query node i in tree
-// tree_offset: the position in full context where the tree starts (prefix_len)
-static bool is_tree_ancestor(const llama_tree_spec * tree_spec, int j, int i, int tree_offset) {
+static bool is_tree_ancestor(const llama_tree_spec * tree_spec, int key_node, int query_node) {
     if (!tree_spec || !tree_spec->parent_ids || tree_spec->n_nodes == 0) {
         return false;
     }
 
-    // Convert context positions to tree-relative positions
-    int j_tree = j - tree_offset;
-    int i_tree = i - tree_offset;
-
-    // If j is in the prefix (j_tree < 0), it's always a valid ancestor
-    // (prefix can attend to tree, though this shouldn't normally happen in tree mode)
-    if (j_tree < 0) {
+    if (key_node < 0) {
         return true;
     }
-
-    // If i is in the prefix (i_tree < 0), this position isn't in the tree
-    if (i_tree < 0) {
+    if (query_node < 0 || key_node >= tree_spec->n_nodes || query_node >= tree_spec->n_nodes) {
         return false;
     }
 
-    // Both j and i should be in tree range [0, n_nodes)
-    if (j_tree < 0 || j_tree >= tree_spec->n_nodes ||
-        i_tree < 0 || i_tree >= tree_spec->n_nodes) {
-        return false;
-    }
-
-    // Trace parent chain from i to root, checking if j is encountered
-    int current = i_tree;
+    int current = query_node;
     while (current != -1) {
-        if (current == j_tree) {
+        if (current == key_node) {
             return true;
         }
         if (current >= 0 && current < tree_spec->n_nodes) {
@@ -1629,6 +1990,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             const uint32_t i = s*n_tps + ii;
 
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const int query_node = ubatch->tree_node_ids ? ubatch->tree_node_ids[i] : -1;
 
             const auto & cells = v_cells.at(seq_to_stream[seq_id]);
 
@@ -1651,7 +2013,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
             auto & idxs = seq_idxs[seq_id];
 
-            if (!alibi) {
+            if (!alibi && !tree_attn) {
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
                     const uint32_t srct = seq_srct[seq_id];
 
@@ -1672,7 +2034,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 uint32_t j = jj;
 
                 // we have an exiting mask for this sequence -> update just seq_idxs
-                if (!alibi) {
+                if (!alibi && !tree_attn) {
                     if (prev) {
                         if (jj >= idxs.size()) {
                             break;
@@ -1693,7 +2055,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 p0 = cells.pos_get(j);
 
-                if (!alibi) {
+                if (!alibi && !tree_attn) {
                     if (!prev) {
                         // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
                         if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
@@ -1722,9 +2084,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 // tree attention: only allow attendance to ancestors in the tree
                 if (tree_attn && args.tree_spec) {
-                    // p0 is the key position, p1 is the query position
-                    // Use tree_offset from args to convert context positions to tree-relative
-                    if (!is_tree_ancestor(args.tree_spec, p0, p1, args.tree_offset)) {
+                    if (!is_tree_ancestor(args.tree_spec, cells.tree_node_get(j), query_node)) {
                         goto skip;
                     }
                 }
@@ -1803,6 +2163,42 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     set_input_kq_mask_with_tree(dst, ubatch, causal_attn, nullptr);
 }
 
+void llama_kv_cache::set_tree_nodes(
+        const llama_ubatch & ubatch,
+        const slot_info & sinfo,
+        const llama_tree_spec * tree_spec) {
+    if (!tree_spec || !tree_spec->parent_ids || tree_spec->n_nodes <= 0 || !ubatch.tree_node_ids) {
+        return;
+    }
+    if (ubatch.n_tokens > 0 && ubatch.tree_node_ids[0] == 0) {
+        for (auto & cells : v_cells) {
+            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+                if (!cells.is_empty(cell) && cells.tree_node_get(cell) >= 0) {
+                    cells.tree_node_set(cell, -1);
+                }
+            }
+        }
+    }
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        auto & cells = v_cells[sinfo.strm[s]];
+        if (std::getenv("COSPEC_DEBUG_TREE_NODE_WRITE") != nullptr) {
+            fprintf(stderr, "[TREE_NODE_STREAM] write_stream=%u seq_stream0=%u n_stream=%u\n",
+                    sinfo.strm[s], seq_to_stream.empty() ? 999u : seq_to_stream[0], sinfo.n_stream());
+        }
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            const uint32_t token = s*sinfo.size() + ii;
+            const int32_t node_id = ubatch.tree_node_ids[token];
+            GGML_ASSERT(node_id >= 0 && node_id < tree_spec->n_nodes);
+            cells.tree_node_set(sinfo.idxs[s][ii], node_id);
+            if (std::getenv("COSPEC_DEBUG_TREE_NODE_WRITE") != nullptr && s == 0 && ii < 20) {
+                fprintf(stderr, "[TREE_NODE_WRITE] token=%u cell=%u pos=%d node=%d seq=%d\n",
+                        token, sinfo.idxs[s][ii], (int) cells.pos_get(sinfo.idxs[s][ii]),
+                        node_id, (int) ubatch.seq_id[token][0]);
+            }
+        }
+    }
+}
+
 void llama_kv_cache::set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_tree_spec * tree_spec) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
@@ -1819,7 +2215,6 @@ void llama_kv_cache::set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_
     //const int64_t t_start = ggml_time_us();
 
     const bool tree_attn = (tree_spec != nullptr && tree_spec->parent_ids != nullptr);
-    const int tree_offset = tree_spec ? tree_spec->tree_offset : 0;
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -1833,7 +2228,6 @@ void llama_kv_cache::set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_
         /*.n_tps            =*/ n_tps,
         /*.tree_spec        =*/ tree_spec,
         /*.tree_attn        =*/ tree_attn,
-        /*.tree_offset      =*/ tree_offset,
     };
 
     if (dst->type == GGML_TYPE_F16) {
@@ -1842,9 +2236,163 @@ void llama_kv_cache::set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
     }
 
+    if (std::getenv("COSPEC_COMPARE_ATTN_MASK") != nullptr) {
+        const size_t elem_size = ggml_type_size(dst->type);
+        const auto * bytes = static_cast<const uint8_t *>(dst->data);
+        for (uint32_t query = 0; query < n_tokens; ++query) {
+            uint64_t hash = 1469598103934665603ULL;
+            int keep = 0;
+            const size_t offset = static_cast<size_t>(query) * n_kv * elem_size;
+            for (int64_t key = 0; key < n_kv; ++key) {
+                const size_t elem_offset = offset + static_cast<size_t>(key) * elem_size;
+                for (size_t byte = 0; byte < elem_size; ++byte) {
+                    hash ^= bytes[elem_offset + byte];
+                    hash *= 1099511628211ULL;
+                }
+                if (dst->type == GGML_TYPE_F16) {
+                    keep += ggml_fp16_to_fp32(
+                        reinterpret_cast<const ggml_fp16_t *>(bytes + elem_offset)[0]) == 0.0f;
+                } else {
+                    keep += reinterpret_cast<const float *>(bytes + elem_offset)[0] == 0.0f;
+                }
+            }
+            fprintf(stderr,
+                    "[ATTN_MASK] tree=%d query=%u node=%d pos=%d keep=%d hash=%016llx\n",
+                    tree_attn, query,
+                    ubatch->tree_node_ids ? ubatch->tree_node_ids[query] : -1,
+                    ubatch->pos[query], keep,
+                    static_cast<unsigned long long>(hash));
+        }
+    }
+
+    if (std::getenv("COSPEC_DUMP_ATTN_VISIBLE_CELLS") != nullptr &&
+        ubatch->n_tokens <= 4) {
+        for (uint32_t qi = 0; qi < ubatch->n_tokens; ++qi) {
+            const llama_seq_id seq_id = ubatch->seq_id[qi][0];
+            const llama_pos query_pos = ubatch->pos[qi];
+            const int query_node = ubatch->tree_node_ids ? ubatch->tree_node_ids[qi] : -1;
+            fprintf(stderr,
+                    "[ATTN_VISIBLE_CELLS] tree=%d query=%u node=%d pos=%d:",
+                    tree_attn ? 1 : 0, qi, query_node, static_cast<int>(query_pos));
+            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+            for (uint32_t cell = 0; cell < static_cast<uint32_t>(n_kv); ++cell) {
+                if (cells.is_empty(cell) || !cells.seq_has(cell, seq_id)) {
+                    continue;
+                }
+                const llama_pos key_pos = cells.pos_get(cell);
+                if (key_pos > query_pos) {
+                    continue;
+                }
+                if (tree_attn && args.tree_spec &&
+                    !is_tree_ancestor(args.tree_spec, cells.tree_node_get(cell), query_node)) {
+                    continue;
+                }
+                fprintf(stderr, " %u(p=%d,n=%d)", cell, static_cast<int>(key_pos),
+                        cells.tree_node_get(cell));
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+void llama_kv_cache::set_input_tree_ancestor_gather(
+        ggml_tensor * idxs,
+        ggml_tensor * mask,
+        const llama_ubatch * ubatch,
+        const llama_tree_spec * tree_spec) const {
+    GGML_ASSERT(idxs && mask && ubatch && tree_spec && tree_spec->parent_ids);
+    GGML_ASSERT(idxs->type == GGML_TYPE_I32 && mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(idxs->ne[0] == mask->ne[0] && idxs->ne[1] == mask->ne[1]);
+    GGML_ASSERT(idxs->ne[1] == ubatch->n_tokens && ubatch->tree_node_ids);
+    GGML_ASSERT(ggml_backend_buffer_is_host(idxs->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
+    GGML_ASSERT(ubatch->n_seqs_unq == 1 && ubatch->n_seq_id[0] == 1);
+
+    const llama_seq_id seq_id = ubatch->seq_id[0][0];
+    const int64_t n_kv = idxs->ne[0];
+    const auto & cells = v_cells.at(seq_to_stream.at(seq_id));
+    const uint32_t cache_n_kv = cells.size();
+    if (std::getenv("COSPEC_DEBUG_TREE_NODE_WRITE") != nullptr) {
+        int used = 0;
+        fprintf(stderr, "[TREE_NODE_STATE] read_stream=%u n_kv=%lld seq=%d:",
+                seq_to_stream.at(seq_id), (long long) n_kv, (int) seq_id);
+        for (uint32_t cell = 0; cell < cache_n_kv; ++cell) {
+            if (!cells.is_empty(cell) && cells.seq_has(cell, seq_id)) {
+                ++used;
+                if (cells.tree_node_get(cell) >= 0) {
+                    fprintf(stderr, " %u(p=%d,n=%d)", cell, (int) cells.pos_get(cell), cells.tree_node_get(cell));
+                }
+            }
+        }
+        fprintf(stderr, " used=%d\n", used);
+    }
+    auto * out_idxs = static_cast<int32_t *>(idxs->data);
+    auto * out_mask = static_cast<float *>(mask->data);
+
+    std::vector<uint32_t> prefix;
+    prefix.reserve(cache_n_kv);
+    for (uint32_t cell = 0; cell < cache_n_kv; ++cell) {
+        if (!cells.is_empty(cell) && cells.seq_has(cell, seq_id) &&
+            cells.tree_node_get(cell) < 0) {
+            prefix.push_back(cell);
+        }
+    }
+    std::stable_sort(prefix.begin(), prefix.end(), [&](uint32_t a, uint32_t b) {
+        return cells.pos_get(a) < cells.pos_get(b);
+    });
+
+    for (uint32_t query = 0; query < ubatch->n_tokens; ++query) {
+        const int32_t query_node = ubatch->tree_node_ids[query];
+        GGML_ASSERT(query_node >= 0 && query_node < tree_spec->n_nodes);
+
+        std::vector<int32_t> path;
+        for (int32_t node = query_node; node >= 0; node = tree_spec->parent_ids[node]) {
+            GGML_ASSERT(node < tree_spec->n_nodes);
+            path.push_back(node);
+        }
+        std::reverse(path.begin(), path.end());
+
+        std::vector<uint32_t> visible(prefix.begin(), prefix.end());
+        for (int32_t node : path) {
+            uint32_t selected = cells.size();
+            int matches = 0;
+            for (uint32_t cell = 0; cell < cache_n_kv; ++cell) {
+                if (!cells.is_empty(cell) && cells.seq_has(cell, seq_id) &&
+                    cells.tree_node_get(cell) == node) {
+                    selected = cell;
+                    ++matches;
+                }
+            }
+            if (matches != 1) {
+                fprintf(stderr,
+                        "[COSPEC_ATTN_ANCESTOR_GATHER_MISS] query=%u query_node=%d path_node=%d matches=%d n_kv=%lld seq=%d\n",
+                        query, query_node, node, matches, (long long) n_kv, (int) seq_id);
+                for (uint32_t cell = 0; cell < cache_n_kv; ++cell) {
+                    if (!cells.is_empty(cell) && cells.seq_has(cell, seq_id) &&
+                        cells.tree_node_get(cell) >= 0) {
+                        fprintf(stderr, " %u:%d", cell, cells.tree_node_get(cell));
+                    }
+                }
+                fprintf(stderr, "\n");
+                GGML_ABORT("ancestor gather tree cell identity missing");
+            }
+            visible.push_back(selected);
+        }
+        GGML_ASSERT(visible.size() <= static_cast<size_t>(n_kv));
+        GGML_ASSERT(static_cast<llama_pos>(visible.size()) == ubatch->pos[query] + 1);
+
+        const int64_t base = static_cast<int64_t>(query) * n_kv;
+        const int32_t pad_cell = visible.empty() ? 0 : static_cast<int32_t>(visible[0]);
+        for (int64_t i = 0; i < n_kv; ++i) {
+            const bool keep = i < static_cast<int64_t>(visible.size());
+            out_idxs[base + i] = keep ? static_cast<int32_t>(visible[i]) : pad_cell;
+            out_mask[base + i] = keep ? 0.0f : -INFINITY;
+        }
+    }
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -1870,6 +2418,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
             }
         }
     }
+
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
@@ -2717,7 +3266,17 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 }
 
 void llama_kv_cache_context::set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const llama_tree_spec * tree_spec) const {
+    kv->set_tree_nodes(*ubatch, sinfos[i_cur], tree_spec);
     kv->set_input_kq_mask_with_tree(dst, ubatch, causal_attn, tree_spec);
+}
+
+void llama_kv_cache_context::set_input_tree_ancestor_gather(
+        ggml_tensor * idxs,
+        ggml_tensor * mask,
+        const llama_ubatch * ubatch,
+        const llama_tree_spec * tree_spec) const {
+    kv->set_tree_nodes(*ubatch, sinfos[i_cur], tree_spec);
+    kv->set_input_tree_ancestor_gather(idxs, mask, ubatch, tree_spec);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

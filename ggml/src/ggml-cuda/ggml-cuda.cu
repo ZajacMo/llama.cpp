@@ -84,6 +84,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -2556,6 +2557,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+
+    // CoSpec tree batches use MMQ while their small canonical replay batches
+    // normally use MMVQ. The two kernels are not numerically interchangeable
+    // for retained KV. This opt-in mode keeps the LM head on its normal MMVQ
+    // path, but makes all quantized transformer projections use MMQ regardless
+    // of batch width so tree and canonical KV are produced by one algorithm.
+    const bool cospec_canonical_mmq = std::getenv("COSPEC_CUDA_CANONICAL_MMQ") != nullptr;
+    const bool is_output_weight = std::strcmp(src0->name, "output.weight") == 0;
+    const bool cospec_canonical_mmq_output =
+        std::getenv("COSPEC_CUDA_CANONICAL_MMQ_OUTPUT") != nullptr;
+    if (cospec_canonical_mmq && (!is_output_weight || cospec_canonical_mmq_output)) {
+        use_mul_mat_vec_q = false;
+    }
 
     bool any_gpus_with_slow_fp16 = false;
 
