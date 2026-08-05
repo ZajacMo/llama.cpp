@@ -28,7 +28,7 @@ static ggml_tensor * build_attn_inp_kq_mask(
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+    const auto n_kv     = llama_kv_slab_round_n_kv(mctx->get_n_kv(), cparams.n_ctx);
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
@@ -47,7 +47,7 @@ static bool can_reuse_kq_mask(
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+    const auto n_kv     = llama_kv_slab_round_n_kv(mctx->get_n_kv(), cparams.n_ctx);
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
@@ -70,7 +70,17 @@ static int64_t tree_gather_width(
             width = std::max<int64_t>(width, static_cast<int64_t>(ubatch.pos[i]) + 1);
         }
     }
-    return std::min<int64_t>(width, mctx->get_n_kv());
+    const int64_t n_kv_logical = mctx->get_n_kv();
+    const int64_t width_capped = std::min<int64_t>(width, n_kv_logical);
+    const int64_t slab = llama_kv_slab_size();
+    if (slab <= 1) {
+        return width_capped;
+    }
+    // Round up to the KV-slab boundary so the tree-gather tensor shape is
+    // stable across rounds within a slab. Padded cells are empty in the
+    // underlying KV cache, so set_input_tree_ancestor_gather writes pad_cell
+    // + -inf mask for them, which has no effect on the gather.
+    return llama_kv_slab_round_n_kv(n_kv_logical, n_kv_logical);
 }
 
 // impl

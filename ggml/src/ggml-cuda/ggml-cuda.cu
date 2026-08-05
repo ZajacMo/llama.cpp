@@ -3314,7 +3314,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // Mix the token dimension into the key: the same nodes[0] address can be
+    // reused by the scheduler arena for different n_tokens topologies (e.g.
+    // multi-token chain decode vs single-token bonus decode alternating in the
+    // same context). Without this, the two shapes share one cache entry and
+    // reset each other's warmup state on every call, so capture never engages.
+    return (const void *) ((const char *) cgraph->nodes[0] + cgraph->nodes[0]->ne[1]);
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -3351,6 +3356,36 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            if (!res && getenv("GGML_CUDA_GRAPH_TRACE") != nullptr) {
+                static int trace3_n = 0;
+                if (trace3_n < 60) {
+                    ++trace3_n;
+                    const auto & oldp = graph->node_props[i];
+                    fprintf(stderr, "[CGRAPH3] node=%d op=%s name=%s data %p->%p",
+                            i, ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name,
+                            oldp.node.data, prop.node.data);
+                    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                        if (cgraph->nodes[i]->src[j] && oldp.node_src_data_ptrs[j] != prop.node_src_data_ptrs[j]) {
+                            fprintf(stderr, " src%d.data %p->%p", j, oldp.node_src_data_ptrs[j], prop.node_src_data_ptrs[j]);
+                        }
+                        if (cgraph->nodes[i]->src[j] && memcmp(oldp.node_src_ne[j], prop.node_src_ne[j], sizeof(prop.node_src_ne[j])) != 0) {
+                            fprintf(stderr, " src%d.ne %lld->%lld", j, (long long) oldp.node_src_ne[j][0], (long long) prop.node_src_ne[j][0]);
+                        }
+                        if (cgraph->nodes[i]->src[j] && memcmp(oldp.node_src_nb[j], prop.node_src_nb[j], sizeof(prop.node_src_nb[j])) != 0) {
+                            fprintf(stderr, " src%d.nb", j);
+                        }
+                    }
+                    if (memcmp(&oldp.node.ne, &prop.node.ne, sizeof(prop.node.ne)) != 0) {
+                        fprintf(stderr, " node.ne %lld,%lld->%lld,%lld",
+                                (long long) oldp.node.ne[0], (long long) oldp.node.ne[1],
+                                (long long) prop.node.ne[0], (long long) prop.node.ne[1]);
+                    }
+                    if (memcmp(&oldp.node.nb, &prop.node.nb, sizeof(prop.node.nb)) != 0) {
+                        fprintf(stderr, " node.nb");
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4537,6 +4572,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
+        if (getenv("GGML_CUDA_GRAPH_TRACE") != nullptr) {
+            static int trace4_n = 0;
+            if (trace4_n < 40) { ++trace4_n; fprintf(stderr, "[CGRAPH4] cudaGraphLaunch key=%p\n", graph_key); }
+        }
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else
         GGML_UNUSED(graph_key);
@@ -4577,10 +4616,26 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    if (getenv("GGML_CUDA_GRAPH_TRACE") != nullptr) {
+        static int trace_n = 0;
+        if (trace_n < 200) {
+            ++trace_n;
+            fprintf(stderr, "[CGRAPH] key=%p n_nodes=%d enabled=%d warmup=%d\n",
+                    graph_key, cgraph->n_nodes, (int) graph->is_enabled(), (int) graph->warmup_complete);
+        }
+    }
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            if (getenv("GGML_CUDA_GRAPH_TRACE") != nullptr) {
+                static int trace2_n = 0;
+                if (trace2_n < 200) {
+                    ++trace2_n;
+                    fprintf(stderr, "[CGRAPH2] key=%p n_nodes=%d props_changed=%d warmup=%d\n",
+                            graph_key, cgraph->n_nodes, (int) properties_changed, (int) graph->warmup_complete);
+                }
+            }
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call

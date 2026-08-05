@@ -2,6 +2,7 @@
 
 #include "ggml.h" // for ggml_log_level
 
+#include <cstdlib>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -34,6 +35,43 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 //
 // helpers
 //
+
+// LLAMA_KV_SLAB environment-variable controls opt-in KV-slab padding for
+// CUDA-graph reuse. When set to a positive integer `S`, attention-related
+// tensors that key off `n_kv` (KQ mask shape, KV-cache view `ne[2]`, and
+// tree-gather idx width) are rounded UP to the next multiple of `S` so the
+// ggml cgraph topology stays stable within a slab. Capped at `n_ctx`.
+// Disabled (no-op) when the env var is unset or `S <= 1`. The padded K
+// cells are masked out via -inf in the KQ mask (set_input_kq_mask_with_tree
+// walks `args.n_kv` cells and writes -inf for empty cells beyond the
+// logical n_kv), so attention numerics are bit-identical to the unpadded
+// computation. See:
+//   llama-graph.cpp: build_attn_inp_kq_mask, can_reuse_kq_mask, tree_gather_width
+//   llama-kv-cache.cpp: get_k/get_v, set_input_kq_mask_with_tree
+static inline int64_t llama_kv_slab_size() {
+    static const int64_t slab = []() -> int64_t {
+        const char * env = getenv("LLAMA_KV_SLAB");
+        if (!env || !*env) return 0;
+        char * end = nullptr;
+        long long v = std::strtoll(env, &end, 10);
+        if (end == env || v <= 1) return 0;
+        return (int64_t) v;
+    }();
+    return slab;
+}
+
+// Round n_kv up to the next KV-slab boundary, capped at n_ctx. When
+// LLAMA_KV_SLAB is unset, returns n_kv unchanged. The caller is responsible
+// for passing n_ctx (the KV cache size / max context) so the result never
+// exceeds the underlying KV buffer.
+static inline int64_t llama_kv_slab_round_n_kv(int64_t n_kv, int64_t n_ctx) {
+    const int64_t slab = llama_kv_slab_size();
+    if (slab <= 1) return n_kv;
+    if (n_kv < 0) return n_kv;
+    int64_t padded = ((n_kv + slab - 1) / slab) * slab;
+    if (padded > n_ctx) padded = n_ctx;
+    return padded;
+}
 
 template <typename T>
 struct no_init {

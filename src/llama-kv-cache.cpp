@@ -2216,6 +2216,11 @@ void llama_kv_cache::set_input_kq_mask_with_tree(ggml_tensor * dst, const llama_
 
     const bool tree_attn = (tree_spec != nullptr && tree_spec->parent_ids != nullptr);
 
+    // When KV-slab padding is enabled, dst->ne[0] already holds the padded n_kv.
+    // Cells beyond the logical n_kv are empty in the KV cache, so the inner
+    // mask loop (which calls cells.is_empty(j)) will write -inf for them
+    // naturally -> padded cells are masked out exactly as -inf, preserving
+    // attention numerics bit-identical to the unpadded computation.
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
         /*.ubatch           =*/ ubatch,
@@ -3218,11 +3223,17 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    // Round up to the KV-slab boundary so the K-view's ne[2] is stable across
+    // rounds within a slab. The padded columns are masked out in the KQ
+    // mask (set_input_kq_mask_with_tree walks empty cells and writes -inf),
+    // so attention numerics are bit-identical to the unpadded compute.
+    const uint32_t n_kv_view = (uint32_t) llama_kv_slab_round_n_kv((int64_t) n_kv, (int64_t) kv->get_size());
+    return kv->get_k(ctx, il, n_kv_view, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    const uint32_t n_kv_view = (uint32_t) llama_kv_slab_round_n_kv((int64_t) n_kv, (int64_t) kv->get_size());
+    return kv->get_v(ctx, il, n_kv_view, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
