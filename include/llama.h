@@ -1166,8 +1166,11 @@ extern "C" {
     // Capture argmax(logits row 0) into a persistent device slot. The next
     // decode can consume that slot as token row 1 without a host round trip.
     LLAMA_API void llama_set_capture_first_output_argmax(struct llama_context * ctx, bool enabled);
+    LLAMA_API void llama_set_capture_output_argmax(struct llama_context * ctx, bool enabled);
     LLAMA_API void llama_use_captured_argmax_as_second_token(struct llama_context * ctx, bool enabled);
     LLAMA_API llama_token llama_get_captured_first_output_argmax(struct llama_context * ctx);
+    LLAMA_API int32_t llama_get_captured_output_argmax(
+            struct llama_context * ctx, llama_token * tokens, int32_t capacity);
 
     // Get the backend sampled probabilities for the ith token
     // The index matches llama_get_sampled_token_ith().

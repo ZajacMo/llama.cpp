@@ -258,8 +258,10 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
     void set_raw_logits_required(bool required);
     void set_capture_first_output_argmax(bool enabled);
+    void set_capture_output_argmax(bool enabled);
     void use_captured_argmax_as_second_token(bool enabled);
     llama_token get_captured_first_output_argmax();
+    int32_t get_captured_output_argmax(llama_token * tokens, int32_t capacity);
 
 private:
     llm_graph_params graph_params(
@@ -394,6 +396,11 @@ private:
     ggml_backend_t captured_argmax_backend = nullptr;
     bool capture_first_output_argmax_armed = false;
     bool use_captured_argmax_second_token = false;
+    ggml_context_ptr captured_output_argmax_ctx;
+    ggml_backend_buffer_ptr captured_output_argmax_buf;
+    ggml_tensor * captured_output_argmax = nullptr;
+    ggml_backend_t captured_output_argmax_backend = nullptr;
+    bool capture_output_argmax_armed = false;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

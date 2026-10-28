@@ -772,6 +772,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.capture_first_output_argmax == other.cparams.capture_first_output_argmax &&
+            cparams.capture_output_argmax   == other.cparams.capture_output_argmax   &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -792,6 +794,7 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
     ggml_tensor * get_first_output_argmax() const { return t_first_output_argmax; }
+    ggml_tensor * get_output_argmax() const { return t_output_argmax; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -824,6 +827,7 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
     ggml_tensor * t_first_output_argmax = nullptr;
+    ggml_tensor * t_output_argmax = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 

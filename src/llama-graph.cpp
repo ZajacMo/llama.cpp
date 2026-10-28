@@ -1272,6 +1272,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_first_output_argmax != nullptr) {
         ggml_set_output(t_first_output_argmax);
     }
+    if (t_output_argmax != nullptr) {
+        ggml_set_output(t_output_argmax);
+    }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
@@ -3826,6 +3829,12 @@ void llm_graph_context::build_sampling() const {
         res->t_first_output_argmax = ggml_argmax(ctx0, row0);
         ggml_set_name(res->t_first_output_argmax, "first_output_argmax");
         ggml_build_forward_expand(gf, res->t_first_output_argmax);
+    }
+
+    if (cparams.capture_output_argmax) {
+        res->t_output_argmax = ggml_argmax(ctx0, res->t_logits);
+        ggml_set_name(res->t_output_argmax, "output_argmax");
+        ggml_build_forward_expand(gf, res->t_output_argmax);
     }
 
     if (samplers.empty()) {

@@ -47,6 +47,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool capture_first_output_argmax = false;
+    bool capture_output_argmax = false;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

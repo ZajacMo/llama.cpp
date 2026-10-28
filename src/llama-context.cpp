@@ -14,6 +14,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -208,6 +209,18 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
+
+    // The fused gated-delta-net chunk kernel is optimized for throughput but
+    // can accumulate a different round-off/state trajectory from repeated
+    // one-token decoding.  CoSpec's paper correctness gate compares batched
+    // verification against the strict AR reference, so expose an explicit
+    // diagnostic escape hatch while retaining the default upstream behavior.
+    if (std::getenv("COSPEC_DISABLE_FUSED_GDN") != nullptr) {
+        cparams.fused_gdn_ar = false;
+        cparams.fused_gdn_ch = false;
+        cparams.auto_fgdn = false;
+        LLAMA_LOG_WARN("%s: fused Gated Delta Net disabled by COSPEC_DISABLE_FUSED_GDN\n", __func__);
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -1345,6 +1358,19 @@ void llama_context::set_capture_first_output_argmax(bool enabled) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_capture_output_argmax(bool enabled) {
+    capture_output_argmax_armed = enabled;
+    if (!enabled || cparams.capture_output_argmax) {
+        return;
+    }
+
+    // Keep the compact per-output argmax node in subsequent graphs. The
+    // one-shot arm controls whether the current decode is copied into the
+    // persistent device slot.
+    cparams.capture_output_argmax = true;
+    sched_need_reserve = true;
+}
+
 void llama_context::use_captured_argmax_as_second_token(bool enabled) {
     use_captured_argmax_second_token = enabled;
 }
@@ -1359,6 +1385,22 @@ llama_token llama_context::get_captured_first_output_argmax() {
         captured_argmax_backend, captured_argmax, &token, 0, sizeof(token));
     ggml_backend_synchronize(captured_argmax_backend);
     return token;
+}
+
+int32_t llama_context::get_captured_output_argmax(
+        llama_token * tokens, int32_t capacity) {
+    if (!tokens || capacity <= 0 || !captured_output_argmax ||
+        !captured_output_argmax_backend) {
+        return 0;
+    }
+
+    const int32_t count = static_cast<int32_t>(
+        std::min<int64_t>(capacity, captured_output_argmax->ne[0]));
+    ggml_backend_tensor_get_async(captured_output_argmax_backend,
+                                  captured_output_argmax, tokens, 0,
+                                  static_cast<size_t>(count) * sizeof(llama_token));
+    ggml_backend_synchronize(captured_output_argmax_backend);
+    return count;
 }
 
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -1553,6 +1595,45 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         ggml_backend_tensor_copy_async(backend, backend, argmax, captured_argmax);
+    }
+
+    if (ggml_tensor * argmax = res->get_output_argmax();
+        argmax && capture_output_argmax_armed) {
+        capture_output_argmax_armed = false;
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), argmax);
+        if (!backend) {
+            LLAMA_LOG_ERROR("%s: failed to locate output argmax backend\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(argmax->buffer);
+        const int64_t count = argmax->ne[0];
+        if (!captured_output_argmax || captured_output_argmax->ne[0] != count ||
+            ggml_backend_buffer_get_type(captured_output_argmax_buf.get()) != buft) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            captured_output_argmax_ctx.reset(ggml_init(params));
+            captured_output_argmax = ggml_new_tensor_1d(
+                captured_output_argmax_ctx.get(), GGML_TYPE_I32, count);
+            captured_output_argmax_buf.reset(
+                ggml_backend_alloc_ctx_tensors_from_buft(
+                    captured_output_argmax_ctx.get(), buft));
+            if (!captured_output_argmax_buf) {
+                captured_output_argmax = nullptr;
+                captured_output_argmax_backend = nullptr;
+                LLAMA_LOG_ERROR("%s: failed to allocate output argmax slot\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            captured_output_argmax_backend = backend;
+        }
+
+        ggml_backend_tensor_copy_async(
+            backend, backend, argmax, captured_output_argmax);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2075,8 +2156,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
+        // CoSpec's exact verifier can request a device-side argmax for the
+        // acceptance walk.  In that mode the compact argmax tensor is the
+        // only output needed for the current ubatch; avoid copying the full
+        // vocabulary row to host unless the caller explicitly re-arms raw
+        // logits (for example, to seed the next round's top-k frontier).
+        const bool compact_argmax_only =
+            cparams.capture_output_argmax && !sampling.raw_logits_required;
         if (logits.data && t_logits && n_outputs > 0 &&
-            (sampling.raw_logits_required || needs_raw_logits(ubatch, sampling.samplers))) {
+            (sampling.raw_logits_required ||
+             (!compact_argmax_only && needs_raw_logits(ubatch, sampling.samplers)))) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -3956,12 +4045,21 @@ void llama_set_capture_first_output_argmax(llama_context * ctx, bool enabled) {
     ctx->set_capture_first_output_argmax(enabled);
 }
 
+void llama_set_capture_output_argmax(llama_context * ctx, bool enabled) {
+    ctx->set_capture_output_argmax(enabled);
+}
+
 void llama_use_captured_argmax_as_second_token(llama_context * ctx, bool enabled) {
     ctx->use_captured_argmax_as_second_token(enabled);
 }
 
 llama_token llama_get_captured_first_output_argmax(llama_context * ctx) {
     return ctx->get_captured_first_output_argmax();
+}
+
+int32_t llama_get_captured_output_argmax(
+        llama_context * ctx, llama_token * tokens, int32_t capacity) {
+    return ctx->get_captured_output_argmax(tokens, capacity);
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
